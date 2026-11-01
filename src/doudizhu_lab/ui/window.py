@@ -130,6 +130,12 @@ class MainWindow(QMainWindow):
         self._task = self._future = None
         self.pool.release_completed()
         self._done(generation, kind, value, error)
+        # 连续启动请求先冻结截图预览，使在途结果失效；必须等工作线程和
+        # Future 都释放后再准备录像，不能把启动请求塞入截图任务队列。
+        # 立即停止、切换设备或关闭窗口会清除请求，此处不会自动恢复它们。
+        if self._continuous_requested and self.recording is None and not self._closing:
+            self._continuous_requested = False
+            self.start_continuous()
 
     def refresh_devices(self) -> None:
         """异步刷新设备；忙碌时不排队，用户可在当前任务结束后再按一次。"""
@@ -294,6 +300,8 @@ class MainWindow(QMainWindow):
                 self._lock_recording(False)
                 self.game_status.setText("收尾失败，已保存的录像和疑点可在会话中核对")
             if kind == "record_start":
+                if self._continuous_requested:
+                    self.continuous_label.setText("连续任务：启动失败 · " + error)
                 self._continuous_requested = False
                 self._lock_recording(False)
                 self.game_status.setText("整局记录不可用：" + error)
@@ -766,6 +774,8 @@ class MainWindow(QMainWindow):
     def stop_bot(self, *_):
         """立即撤销输入授权，随后由后台线程收尾；不会等待模型推理完成。"""
         self.input_gate.revoke()
+        if self._continuous_requested:
+            self.continuous_label.setText("连续任务：启动已取消")
         self._continuous_requested = False
         if self.continuous:
             self.continuous.stop()
@@ -775,15 +785,40 @@ class MainWindow(QMainWindow):
         self.bot_mode.setCurrentIndex(0)
         self.bot_mode.blockSignals(False)
 
-    def start_continuous(self):
-        """一次点击准备录像、模型及流程；匹配只能由后台在稳定大厅观察上触发。"""
+    def start_continuous(self) -> None:
+        """在 GUI 线程申请连续任务，准备录像、模型及流程，不直接点击手机。
+
+        截图或识别尚未完成时先暂停预览，仅保留一次启动请求，由收取结果的
+        定时器在后台任务释放后继续；其他启动、收尾任务仍拒绝并发操作。
+        用户停止或切换设备会取消待启动请求，准备失败通过中文日志说明。
+        真正匹配仍须等待后台确认稳定大厅、模型和输入授权。
+        """
         from doudizhu_lab.vision.assets import model_path
 
-        if self.busy or self._record_stopping:
-            self.log("请等待当前任务收尾")
+        if self._closing:
+            return
+        if self._continuous_requested:
+            self.log("连续任务正在启动；如需取消，请点击“立即停止 / 人工接管”")
             return
         if self.continuous and self.continuous.status in ("running", "paused"):
             self.log("已有连续任务，暂停后请使用恢复或立即停止")
+            return
+        if self.busy or self._record_stopping:
+            if (
+                self.busy
+                and self._kind in ("capture", "recognize")
+                and self.recording is None
+                and not self._record_stopping
+            ):
+                # 暂停会递增会话编号并撤销旧点击；已执行的截图只能等待返回，
+                # 不能强行释放 busy，否则录像与截图会同时占用单任务执行器。
+                self.pause()
+                self._pending_recognition = False
+                self._continuous_requested = True
+                self.continuous_label.setText("连续任务：正在启动 · 等待当前画面读取完成")
+                self.log("已暂停截图预览；当前画面读取结束后自动启动连续游戏，无需重复点击")
+            else:
+                self.log("当前任务正在启动或收尾，请稍后再启动连续游戏")
             return
         try:
             if self.input_gate.transport != "simulation":
@@ -797,9 +832,16 @@ class MainWindow(QMainWindow):
             if self.recording is None:
                 self.toggle_recording()
                 self._continuous_requested = self._kind == "record_start"
+                self.continuous_label.setText(
+                    "连续任务：正在启动 · 准备视频通道"
+                    if self._continuous_requested
+                    else "连续任务：未启动 · 请检查日志"
+                )
             else:
+                self._continuous_requested = True
                 self._launch_continuous()
         except (OSError, ValueError) as exc:
+            self.continuous_label.setText(f"连续任务：启动失败 · {exc}")
             self.log(f"连续任务未启动：{exc}")
 
     def change_continuous_policy(self):
@@ -816,10 +858,16 @@ class MainWindow(QMainWindow):
         self.store.profile.bid_settings["mode"] = self.bidding_mode.currentData()
         self.store.save()
 
-    def _launch_continuous(self):
-        """视频启动成功后再创建任务；失败或被用户取消的启动不会留下自动输入授权。"""
+    def _launch_continuous(self) -> None:
+        """在 GUI 线程消费有效启动请求；视频就绪后才创建连续任务并申请输入。
+
+        视频完成与本回调之间仍可能收到停止或关闭操作，必须再次核对请求，
+        避免已排入 Qt 事件队列的回调重新授予被用户撤销的自动输入权限。
+        """
         from doudizhu_lab.runtime.continuous import ContinuousRuntime
 
+        if not self._continuous_requested or self._closing:
+            return
         self._continuous_requested = False
         if not self.recording or self._record_stopping:
             return

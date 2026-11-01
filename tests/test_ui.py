@@ -3,6 +3,7 @@
 from dataclasses import replace
 from threading import Event
 from time import monotonic
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -31,6 +32,166 @@ def window(qtbot, tmp_path, frame):
     window._tick()
     # pytest-qt 在自己的 teardown 中关闭并 deleteLater；不能再由 fixture 二次释放。
     return window
+
+
+@pytest.fixture
+def continuous_backend(window, monkeypatch, tmp_path):
+    """替换连续启动的模型、录像及执行后端，测试只运行真实的 GUI 调度流程。"""
+    pipeline = Mock()
+    pipeline.session.folder = tmp_path / "模拟录像"
+    runtime = Mock(status="running", store=SimpleNamespace(folder=tmp_path / "模拟连续任务"))
+    recording_factory = Mock(return_value=pipeline)
+    runtime_factory = Mock(return_value=runtime)
+    monkeypatch.setattr("doudizhu_lab.vision.assets.model_path", Mock())
+    monkeypatch.setattr("doudizhu_lab.ui.window.RecordingPipeline", recording_factory)
+    monkeypatch.setattr("doudizhu_lab.runtime.continuous.ContinuousRuntime", runtime_factory)
+    monkeypatch.setattr(window, "load_bot", Mock())
+    monkeypatch.setattr(window.client, "capture", Mock())
+    monkeypatch.setattr(window.client, "tap", Mock())
+    yield SimpleNamespace(
+        pipeline=pipeline,
+        runtime=runtime,
+        recording_factory=recording_factory,
+        runtime_factory=runtime_factory,
+    )
+    window.recording = None
+    window.continuous = None
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("kind", ["capture", "recognize"])
+def test_continuous_start_waits_for_preview_and_starts_once(window, continuous_backend, frame, qtbot, kind):
+    release = Event()
+    previous = window.frame
+
+    def read_frame():
+        release.wait(5)
+        return replace(frame, captured_at="暂停前的迟到帧"), Recognition([], "旧画面", 0)
+
+    assert window._submit(kind, read_frame)
+    window._pending_tap = (100, 200, frame)
+    window._pending_recognition = True
+    try:
+        window.continuous_start.click()
+        window.continuous_start.click()
+        assert window.busy and window._continuous_requested and not window.running
+        assert window._pending_tap is None and not window._pending_recognition
+        assert "等待当前画面" in window.continuous_label.text()
+        window._tick()
+        continuous_backend.recording_factory.assert_not_called()
+        window.load_bot.assert_not_called()
+        assert window.pool.activeThreadCount() == 1
+    finally:
+        release.set()
+    qtbot.waitUntil(lambda: continuous_backend.runtime.start.called, timeout=3000)
+    assert window.recording is continuous_backend.pipeline
+    assert window.continuous is continuous_backend.runtime
+    assert window.frame is previous
+    assert not window._continuous_requested and not window.busy
+    window.load_bot.assert_called_once_with()
+    continuous_backend.recording_factory.assert_called_once()
+    continuous_backend.pipeline.start.assert_called_once_with()
+    continuous_backend.runtime_factory.assert_called_once()
+    window.client.capture.assert_not_called()
+    window.client.tap.assert_not_called()
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("cancel", ["stop", "pause", "device", "close"])
+def test_waiting_continuous_start_can_be_cancelled(window, continuous_backend, frame, qtbot, cancel):
+    release = Event()
+
+    def read_frame():
+        release.wait(5)
+        return frame, Recognition([], "旧画面", 0)
+
+    assert window._submit("capture", read_frame)
+    try:
+        window.continuous_start.click()
+        assert window._continuous_requested
+        if cancel == "close":
+            # 任务已返回但尚未由 GUI 收取时关闭，也不能消费待启动请求。
+            release.set()
+            window.close()
+        else:
+            {"stop": window.stop_bot, "pause": window.pause, "device": window._device_changed}[cancel]()
+    finally:
+        release.set()
+    if cancel != "close":
+        qtbot.waitUntil(lambda: not window.busy, timeout=2000)
+    assert not window._continuous_requested
+    assert window.input_gate.owner is None
+    continuous_backend.recording_factory.assert_not_called()
+    continuous_backend.runtime_factory.assert_not_called()
+    window.load_bot.assert_not_called()
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("kind", ["devices", "tap", "record_start", "record_stop"])
+def test_continuous_start_does_not_interrupt_other_tasks(window, continuous_backend, qtbot, kind):
+    release = Event()
+    assert window._submit(kind, lambda: release.wait(5))
+    try:
+        window.continuous_start.click()
+        assert not window._continuous_requested
+        assert "正在启动或收尾" in window.log_view.toPlainText()
+        continuous_backend.recording_factory.assert_not_called()
+    finally:
+        window.pause()
+        release.set()
+    qtbot.waitUntil(lambda: not window.busy, timeout=2000)
+    continuous_backend.runtime_factory.assert_not_called()
+
+
+@pytest.mark.gui
+def test_stop_cancels_continuous_launch_already_queued_by_video(window, continuous_backend, qtbot):
+    window._continuous_requested = True
+    window._done(window.generation, "record_start", continuous_backend.pipeline, "")
+    window.bot_stop.click()
+    qtbot.wait(50)
+    assert window.recording is continuous_backend.pipeline
+    assert not window._continuous_requested and window.input_gate.owner is None
+    continuous_backend.runtime_factory.assert_not_called()
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("failure", ["assets", "recording"])
+def test_deferred_continuous_start_reports_failure_without_retry(
+    window, continuous_backend, frame, qtbot, monkeypatch, failure
+):
+    if failure == "assets":
+        monkeypatch.setattr(
+            "doudizhu_lab.vision.assets.model_path", Mock(side_effect=ValueError("测试模型不可用"))
+        )
+    else:
+        continuous_backend.pipeline.start.side_effect = ValueError("测试视频不可用")
+    release = Event()
+
+    def read_frame():
+        release.wait(5)
+        return frame, Recognition([], "旧画面", 0)
+
+    assert window._submit("capture", read_frame)
+    try:
+        window.continuous_start.click()
+        assert window._continuous_requested
+    finally:
+        release.set()
+    qtbot.waitUntil(lambda: not window.busy and not window._continuous_requested, timeout=3000)
+    assert "启动失败" in window.continuous_label.text()
+    assert window.recording is None and window.input_gate.owner is None
+    continuous_backend.runtime_factory.assert_not_called()
+    assert continuous_backend.pipeline.start.call_count == int(failure == "recording")
+
+
+@pytest.mark.gui
+def test_continuous_start_reuses_current_video_session(window, continuous_backend):
+    window.recording = continuous_backend.pipeline
+    window.continuous_start.click()
+    assert window.continuous is continuous_backend.runtime
+    assert not window._continuous_requested
+    continuous_backend.runtime.start.assert_called_once_with()
+    continuous_backend.recording_factory.assert_not_called()
 
 
 @pytest.mark.gui
