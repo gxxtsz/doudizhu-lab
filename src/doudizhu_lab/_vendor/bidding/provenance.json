@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/Vincentzyx/DouZero_For_HLDDZ_FullAuto",
+  "commit": "6d20491da216c989d23cf2883498758fb78e9f8d",
+  "license": "Apache-2.0",
+  "source_file": "BidModel.py",
+  "source_sha256": "906ce0bd498991263196a828663316f4e5e550db587639c25c274ee4418b8ef7",
+  "changes": "只移植Net2结构及RealToOnehot计数编码；不引入训练代码、设备控制及未加载的Net/predict路径",
+  "network_sha256": "1832c789559f20cf7aa0ca7ead9f63bc4684020bd7c698143baa091561aca31f",
+  "weights_sha256": "320e9d96e3aa6f962e27f0b8f5f1d97c15af719bc5cb30ed5423b9c025bb4801"
+}

@@ -1,0 +1,44 @@
+name: 代码与公共测试
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+      DDZ_DATA_DIR: ${{ runner.temp }}/doudizhu-lab-data
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: 安装uv与Python
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.10.9"
+          python-version: "3.11"
+      - name: 安装锁定环境（不含OCR与推理权重）
+        run: uv sync --frozen
+      - name: 静态与格式检查
+        run: |
+          uv run ruff check .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run ruff format --check .
+      - name: 公共测试（合成数据与模拟设备）
+        run: uv run pytest -m "not local_data and not model" -q
+      - name: 构建发行包并检查内容
+        run: |
+          uv build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run python tools/check_distribution.py
+      - name: 验证实际安装后的wheel
+        run: |
+          $wheel = Get-ChildItem dist -Filter *.whl | Select-Object -First 1
+          uv pip install --no-deps --reinstall $wheel.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .venv/Scripts/python.exe -I tools/smoke_installed.py --output "${{ runner.temp }}/wheel-smoke.json"

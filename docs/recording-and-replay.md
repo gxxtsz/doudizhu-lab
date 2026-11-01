@@ -1,0 +1,29 @@
+# 记录、回放与纠错
+
+使用scrcpy-server 5.0.1只读视频通道，无音频、控制和剪贴板。ADB点击由独立输入闸门管理。默认2400×1080、视频上限15 FPS、8 Mbps，牌桌分析上限10 FPS。
+
+点击开始记录后先保存录像，再建立会话。录像按关键帧每约两分钟分段为MKV；SQLite保存原始观察、确认事件、疑点、机器人意图和人工修订。分析忙时可跳帧，完整录像保留；写盘或采集中断登记缺口。
+
+停止后进入会话列表，拖动时间轴、逐帧查看或跳转事件与疑点。独立标注默认隐藏自动预测；纠错追加修订，不覆盖原始观察。修改牌局边界不会移除真实采集缺口。
+
+```powershell
+uv run ddz-check audit-video .\data\sessions\示例会话
+uv run ddz-check reanalyze .\data\sessions\示例会话
+uv run ddz-check evaluate-session .\data\sessions\示例会话 --labels .\独立标注.json --require-pass
+```
+
+重算生成独立版本，不覆盖实时记录；自动、离线和人工修订分别报告。未完成的事件识别验收不能用流程运行或模型合法建议代替。
+
+## 源码快照
+
+源码运行和wheel安装后均会保存同版程序、`uv.lock`、工程元数据和许可证。快照使用文件哈希核验，读取时不执行其中代码。
+
+旧会话及旧快照保持原内容，可通过显式目录打开。原机器上的历史资料不随新项目复制；旧快照保留旧内部包路径，必须使用其自身的锁定工程才能重现当时算法。新版重新分析的结果不能冒充旧版实时结果。
+
+回放建议评测必须显式给出预先选定的范围：
+
+```powershell
+uv run ddz-check evaluate-bot --mode replay --session .\数据\示例会话 --scope .\范围.json --require-pass
+```
+
+格式见[合成范围示例](../examples/replay-scope.example.json)。范围只用于选局，不向模型提供事件答案、隐藏手牌或未来信息。

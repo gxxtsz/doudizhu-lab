@@ -1,0 +1,23 @@
+name: 问题报告
+description: 报告可复现的软件问题，请先去除昵称、设备号和个人路径。
+title: "[问题] "
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境与版本
+      description: 程序版本、Windows、Python及安装方式。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤、预期与实际行为
+      description: 优先提供合成样本或最小示例；不要上传完整牌局、账户信息或未经处理的日志。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已脱敏的错误与诊断
+      render: text

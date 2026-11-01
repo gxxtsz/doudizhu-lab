@@ -1,0 +1,54 @@
+{
+  "revision": "718a5c920bf3361e34178a38f3b80458e176b351",
+  "adaptation": "0.5版仅将包内导入适配为doudizhu_lab._vendor；规则、特征与网络算法保持上游实现，保留上游和适配后哈希",
+  "files": [
+    {
+      "file": "LICENSE",
+      "url": "https://raw.githubusercontent.com/kwai/DouZero/718a5c920bf3361e34178a38f3b80458e176b351/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "upstream_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "file": "env/env.py",
+      "url": "https://raw.githubusercontent.com/kwai/DouZero/718a5c920bf3361e34178a38f3b80458e176b351/douzero/env/env.py",
+      "sha256": "ffa7a2dbdf02bfeaa4128bd69124594328389ab62e18c3741345e055def05945",
+      "upstream_sha256": "43012a3b7672e054b81212dc5b2456b7648ad1d46ebb1217363d897f74233330"
+    },
+    {
+      "file": "env/game.py",
+      "url": "https://raw.githubusercontent.com/kwai/DouZero/718a5c920bf3361e34178a38f3b80458e176b351/douzero/env/game.py",
+      "sha256": "7648ce8e84e57a66c2c008f507ae04ab54c05abe00fad5ad51f8ec33980f5ffb",
+      "upstream_sha256": "09e76db9d90eb8dffbb747325fdd5ac86d7fc00873e6c862e3dd3dbadd4d0e96"
+    },
+    {
+      "file": "env/utils.py",
+      "url": "https://raw.githubusercontent.com/kwai/DouZero/718a5c920bf3361e34178a38f3b80458e176b351/douzero/env/utils.py",
+      "sha256": "c4dab1343fa9e189c0f66a24363c5fa80f5bc3f1517dc0e45ef419367be5d48c",
+      "upstream_sha256": "c4dab1343fa9e189c0f66a24363c5fa80f5bc3f1517dc0e45ef419367be5d48c"
+    },
+    {
+      "file": "env/move_generator.py",
+      "url": "https://raw.githubusercontent.com/kwai/DouZero/718a5c920bf3361e34178a38f3b80458e176b351/douzero/env/move_generator.py",
+      "sha256": "212d0d2e23cfd8c417b30ede228bb4418b9c2e6ae464b42d517486f211494690",
+      "upstream_sha256": "157cb79cccc89110b6b6c49700e4860bf09b287b5356811ea7a1f81552649685"
+    },
+    {
+      "file": "env/move_detector.py",
+      "url": "https://raw.githubusercontent.com/kwai/DouZero/718a5c920bf3361e34178a38f3b80458e176b351/douzero/env/move_detector.py",
+      "sha256": "05f105ca7de958fdfb6a9fcdb3250a1424562a89cbc6eca7e09e39d3f0beb551",
+      "upstream_sha256": "d1a264e4084138b870c5dbb31ce723347164047653b872737bd511eb10cc4cfe"
+    },
+    {
+      "file": "env/move_selector.py",
+      "url": "https://raw.githubusercontent.com/kwai/DouZero/718a5c920bf3361e34178a38f3b80458e176b351/douzero/env/move_selector.py",
+      "sha256": "40aa53c9284617a606d89168cc70fc9581ce66f6ced131dcfba3f4cf1df16c38",
+      "upstream_sha256": "40aa53c9284617a606d89168cc70fc9581ce66f6ced131dcfba3f4cf1df16c38"
+    },
+    {
+      "file": "dmc/models.py",
+      "url": "https://raw.githubusercontent.com/kwai/DouZero/718a5c920bf3361e34178a38f3b80458e176b351/douzero/dmc/models.py",
+      "sha256": "3ad5483bf3d82b3a4174ee3a8893891dafcd635590e9cd7372fabe5988e8a190",
+      "upstream_sha256": "3ad5483bf3d82b3a4174ee3a8893891dafcd635590e9cd7372fabe5988e8a190"
+    }
+  ]
+}

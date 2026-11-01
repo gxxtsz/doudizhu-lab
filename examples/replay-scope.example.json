@@ -1,0 +1,7 @@
+{
+  "source": "合成示例范围，请替换为自己录像中预先选定的连续牌局边界，不提供决策答案",
+  "games": [
+    {"game_id": "example-01", "start_us": 1000000, "end_us": 61000000, "incomplete": false},
+    {"game_id": "example-02", "start_us": 65000000, "end_us": 120000000, "incomplete": true}
+  ]
+}

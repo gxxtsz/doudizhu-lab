@@ -1,0 +1,55 @@
+# 安装与启动
+
+目前支持Windows、Python 3.11和USB安卓真机；其他系统尚未完成设备与窗口验收。首次运行建议先使用模拟器演示，不连接手机。
+
+## 环境
+
+安装uv和Android Platform Tools。ADB放入PATH，或在窗口中选择其完整路径；也可设置`ADB_PATH`。程序不捆绑ADB，不修改手机权限。
+
+```powershell
+uv sync --frozen
+uv run ddz-lab --version
+uv run ddz-lab
+```
+
+连续流程和可选手牌OCR需要额外依赖：
+
+```powershell
+uv sync --frozen --extra vision
+uv run ddz-check setup-video
+uv run ddz-check setup-agent
+uv run ddz-check setup-bidding
+uv run --extra vision ddz-check setup-vision
+```
+
+这些准备命令会显式联网下载固定版本并检查SHA-256；正式运行不隐式下载。`setup-agent`准备三种身份的WP副本，`setup-bidding`准备叫抢模型，`setup-vision`只准备三份PP-OCRv5模型。不训练模型。
+
+网络较慢时，可以在本机安装命令中选择可信镜像；请保留PyTorch CPU专用索引和锁文件校验。项目默认索引仍为官方PyPI，不提交个人镜像设置。
+
+## 不连接手机的演示
+
+模型准备完成后：
+
+```powershell
+uv run ddz-bot-demo
+```
+
+演示使用模拟设备，不能证明真实牌面识别或实际操作成功率。`ddz-device`兼容旧桌面启动命令；`python -m doudizhu_lab`也可启动桌面程序。
+
+## 连接手机
+
+1. 打开USB调试，连接可传输数据的USB线，在手机上授权电脑。
+2. 刷新设备并选择手机，开始预览；先检查方向、图像尺寸和各区域。
+3. 按[校准指南](calibration.md)采集自己的模板与按钮布局。公开源码不含游戏图片或预配置的可执行按钮。
+4. 先使用仅建议，再逐步验证同一张牌选中与取消、单步动作和结果确认。
+
+小米系统若返回`INJECT_EVENTS`权限错误，检查手机上的“USB调试（安全设置）”。程序会显示原始诊断，不自动打开权限、不修改系统设置。
+
+## 常见问题
+
+- **模型未就绪**：检查对应准备命令及本机清单；缺失、损坏或不兼容都会阻止执行，不使用随机权重。
+- **整局记录不可用**：检查scrcpy组件、USB连接、前台状态和可用空间。视频失败不会静默宣称完整录制。
+- **无法确认牌面**：检查布局、模板覆盖、遮挡及动画。未知区域不等于没有牌。
+- **健康系统或账户提示**：任务停止并保留现场；不使用旧牌桌状态继续点击。
+
+数据目录、覆盖顺序及默认行为见[配置说明](configuration.md)；当前实际完成程度见[验证状态](validation.md)。
