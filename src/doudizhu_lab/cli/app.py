@@ -18,9 +18,10 @@ from doudizhu_lab.ui.window import MainWindow
 def main() -> None:
     """在 GUI 主线程解析命令行并启动窗口；正常关闭后返回 None。
 
-    --data-dir 用于隔离测试数据，--preview 用于只读预览；--flow-room 接受明确的
+    --data-dir 用于隔离测试数据，--preview 显式只读预览；默认也会预览唯一授权手机。
+    窗口显示后自动后台加载本地 WP 模型，不隐式下载；--flow-room 接受明确的
     洗牌场次或“当前”，后者沿用初、中、高级场。该偏好本身不启动匹配或授予输入。
-    只有用户显式启动连续游戏后，窗口才准备模型和录像并申请输入；参数错误由
+    只有用户显式启动连续游戏后，窗口才准备录像并申请输入；参数错误由
     argparse 以 SystemExit 拒绝，配置加载错误通过中文对话框说明后退出。
     """
     configure_console()
@@ -31,7 +32,7 @@ def main() -> None:
         "--hand-ocr", action="store_true", help="试用免训练手牌OCR；需要 vision 依赖与模型"
     )
     classifier.add_argument("--hand-template", action="store_true", help="本次启动使用传统手牌模板")
-    parser.add_argument("--preview", action="store_true", help="仅一台授权设备时自动开始只读预览")
+    parser.add_argument("--preview", action="store_true", help="显式只读预览；默认自动预览唯一授权手机")
     parser.add_argument("--record", action="store_true", help="仅一台授权设备时自动开始整局记录")
     parser.add_argument(
         "--flow-room",
@@ -81,24 +82,20 @@ def main() -> None:
             store.profile.continuous_settings["max_games"] = args.max_games
         if args.time_limit:
             store.profile.continuous_settings["time_limit"] = args.time_limit
-        window = MainWindow(store)
+        startup_action = (
+            "continuous"
+            if args.continuous
+            else "record"
+            if args.record
+            else "preview"
+            if args.preview
+            else ""
+        )
+        window = MainWindow(store, startup_action=startup_action, acceptance=args.acceptance)
     except (ValueError, OSError) as exc:
         QMessageBox.critical(None, "启动失败", str(exc))
         raise SystemExit(1) from exc
     window.show()
-    window.acceptance.setChecked(args.acceptance)
-    if args.preview or args.record or args.continuous:
-
-        def start_when_ready():
-            if not window.busy and window.devices.count() == 1 and not window.running:
-                if args.continuous:
-                    window.start_continuous()
-                else:
-                    window.toggle_recording() if args.record else window.toggle_preview()
-            elif window.busy:
-                QTimer.singleShot(250, start_when_ready)
-
-        QTimer.singleShot(500, start_when_ready)
     if args.quit_after:
         QTimer.singleShot(args.quit_after * 1000, window.close)
     app.exec()

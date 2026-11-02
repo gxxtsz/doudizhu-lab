@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from threading import Event, RLock, Thread
 from time import monotonic
 from uuid import uuid4
@@ -11,6 +12,19 @@ from doudizhu_lab.agents.bidding import BidAgent, BiddingController, decision_di
 from doudizhu_lab.devices.adb import InputRejected
 from doudizhu_lab.storage.runs import RunStore, evaluate_run
 from doudizhu_lab.vision.flow import SCENE_NAMES
+
+
+@dataclass(frozen=True)
+class ContinuousProgress:
+    """任务界面的只读进度；时间单位为秒，completed 只统计已确认完成的牌局。"""
+
+    status: str
+    scene: str
+    reason: str
+    completed: int
+    total: int
+    elapsed: float
+    time_limit: int
 
 
 class ContinuousRuntime:
@@ -46,10 +60,32 @@ class ContinuousRuntime:
         self._stop_request_handled = False
         self.bid_agent, self.bidding = bid_agent, None
         self.bid_decision, self.bid_description = None, ""
+        self._stop_intent = None
+        self._progress_cache = ContinuousProgress(
+            "idle", "unknown", "", 0, self.settings["max_games"], 0, self.settings["time_limit"]
+        )
 
     @property
     def active(self):
-        return self.status == "running"
+        return self.status == "running" and not self.stop_event.is_set()
+
+    def progress(self) -> ContinuousProgress:
+        """返回只读进度；设备操作持锁时返回上次快照，不让 GUI 等待 USB 或账本写入。"""
+        if not self.lock.acquire(blocking=False):
+            return self._progress_cache
+        try:
+            self._progress_cache = ContinuousProgress(
+                self.status,
+                self.scene,
+                self.reason,
+                len(self.completed),
+                self.settings["max_games"],
+                max(0, self.clock() - self.started),
+                self.settings["time_limit"],
+            )
+            return self._progress_cache
+        finally:
+            self.lock.release()
 
     @property
     def description(self):
@@ -138,9 +174,22 @@ class ContinuousRuntime:
             if self.last_flow:
                 self.pipeline.evidence.submit(self.last_flow.frame, ["continuous-pause"])
 
+    def request_stop(self, reason: str = "用户停止连续任务", *, manual: bool = True) -> None:
+        """GUI 的非阻塞停止意图；立即减权并停止循环，正式账本由后台 close/stop 收尾。
+
+        不取得流程锁，因此即便已有一个 ADB 命令在途也立即返回。窗口同时锁住输入闸门，
+        防止正在结束的一轮后台工作重新授权；已发命令仍保留原本的在途记录。
+        """
+        self.gate.revoke()
+        self.bot.set_mode("stop")
+        self._stop_intent = (reason, manual)
+        self.stop_event.set()
+
     def stop(self, reason="用户停止连续任务", *, manual=True):
         """停止后不再恢复本任务；先撤销输入，再让线程和录像分别收尾。"""
         with self.lock:
+            if self._stop_intent:
+                (reason, manual), self._stop_intent = self._stop_intent, None
             self.gate.revoke()
             self.bot.set_mode("stop")
             if self.status not in ("completed", "stopped", "idle"):

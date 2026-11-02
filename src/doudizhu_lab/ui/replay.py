@@ -1,11 +1,9 @@
-"""会话浏览、录像逐帧核对及追加纠错窗口。整个窗口不持有 ADB 客户端。"""
+"""精简的离线录像回放与基础纠错；窗口不持有设备或输入授权。"""
 
 from __future__ import annotations
 
-import hashlib
-import json
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from pathlib import Path
 from threading import Event
 
 from PySide6.QtCore import Qt, QTimer
@@ -19,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSlider,
@@ -29,14 +28,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from doudizhu_lab.domain.models import RANKS, REGION_NAMES
+from doudizhu_lab.domain.models import RANKS
 from doudizhu_lab.domain.table import PHASE_NAMES, SEAT_NAMES
 from doudizhu_lab.domain.tracker import replay_events
-from doudizhu_lab.storage.config import Store, write_rgb
-from doudizhu_lab.storage.replay import VideoReplay, profile_from_dict, reanalyze
+from doudizhu_lab.storage.config import Store
+from doudizhu_lab.storage.replay import VideoReplay, profile_from_dict
 from doudizhu_lab.storage.session import SessionStore
 from doudizhu_lab.ui.canvas import FrameCanvas
-from doudizhu_lab.vision.table import MarkerLibrary
+from doudizhu_lab.ui.components import card
+from doudizhu_lab.ui.components import label as make_label
+from doudizhu_lab.ui.state import duration_text
+from doudizhu_lab.ui.theme import STYLE
 
 KINDS = {
     "game_start": "开局",
@@ -48,20 +50,10 @@ KINDS = {
     "gap": "疑点 / 缺口",
     "game_end": "结算",
 }
-MARKERS = {
-    "landlord": "地主标志",
-    "turn": "行动提示",
-    "count": "剩牌数字",
-    "pass": "不出文字",
-    "phase": "阶段按钮",
-    "result": "结算",
-    "bottom_back": "底牌背面",
-    "winner": "最后出牌提示",
-}
 
 
 def parse_cards(text: str) -> list[str]:
-    """将用户输入转换为牌点列表，保留重复张数；未知字词明确报错。"""
+    """将输入转换为牌点列表，保留重复张数；未知字词抛出中文 ValueError。"""
     cards = (
         text.upper().replace("小王", "SJ").replace("大王", "BJ").replace("，", " ").replace(",", " ").split()
     )
@@ -73,11 +65,16 @@ def parse_cards(text: str) -> list[str]:
 class EventEditor(QDialog):
     """编辑事件的业务字段；保存只追加修订，不覆盖原事件。"""
 
-    def __init__(self, event: dict, parent=None):
+    def __init__(self, event: dict, parent=None) -> None:
+        """GUI 线程编辑事件副本；提交前不修改会话，非法牌点由 value 抛出 ValueError。"""
         super().__init__(parent)
+        self.setStyleSheet(STYLE)
         self.setWindowTitle("纠正事件 / 初始信息")
         self.original = event
-        form = QFormLayout(self)
+        form = self.form = QFormLayout(self)
+        form.setContentsMargins(22, 20, 22, 20)
+        form.setSpacing(12)
+        self.setMinimumWidth(460)
         self.kind = QComboBox()
         for key, label in KINDS.items():
             self.kind.addItem(label, key)
@@ -146,8 +143,19 @@ class EventEditor(QDialog):
         buttons.accepted.connect(self.validate)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+        self.kind.currentIndexChanged.connect(self.update_fields)
+        self.update_fields()
+
+    def update_fields(self) -> None:
+        """按事件类型展示相关字段；不清空隐藏字段，切换类型或取消不会丢失原始数据。"""
+        kind = self.kind.currentData()
+        setup = kind in ("game_start", "setup")
+        for field in (self.landlord, self.hand, self.bottom, self.order, self.remaining, self.incomplete):
+            self.form.setRowVisible(field, setup)
+        self.form.setRowVisible(self.phase, setup or kind == "phase")
 
     def value(self) -> dict:
+        """返回待追加的事件副本；保留重复牌点和原有数据，非法输入抛出中文 ValueError。"""
         value = dict(self.original) | {
             "kind": self.kind.currentData(),
             "pts_us": round(self.time.value() * 1e6),
@@ -177,7 +185,8 @@ class EventEditor(QDialog):
             raise ValueError("请填写事件所属牌局编号")
         return value
 
-    def validate(self):
+    def validate(self) -> None:
+        """GUI 线程校验后接受对话框；错误原地提示，尚不向会话写入修订。"""
         try:
             self.value()
             self.accept()
@@ -186,112 +195,108 @@ class EventEditor(QDialog):
 
 
 class SessionDialog(QDialog):
-    """回放与纠错完全离线；耗时定位和重算使用一个后台线程，滑动请求只保留最新位置。"""
+    """离线回放及追加纠错；定位使用单个后台线程，滑动只保留最新请求，不创建 ADB。"""
 
-    def __init__(self, store: Store, parent=None):
+    def __init__(self, store: Store, parent=None, *, initial_folder: Path | None = None) -> None:
+        """GUI 线程创建回放窗口；initial_folder 可定位刚完成的会话，缺失时选择最近会话。"""
         super().__init__(parent)
         self.store = store
         self.session = self.replay = self.frame = None
         self.future = None
         self.pending_seek = None
         self.job = ""
+        self.initial_folder = initial_folder
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="离线回放")
         self.cancel = Event()
-        self.setWindowTitle("会话 · 回放 · 纠错（离线，不发送手机输入）")
-        self.resize(1380, 930)
+        self.setWindowTitle("录像回放 · 斗地主实验室")
+        self.setStyleSheet(STYLE)
+        self.resize(1380, 860)
+        self.setMinimumSize(1100, 720)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(16)
+        heading = QHBoxLayout()
+        heading.addWidget(make_label("录像回放", "title"))
+        heading.addStretch()
+        heading.addWidget(make_label("本地录像 · 基础纠错", "muted"))
+        layout.addLayout(heading)
         top = QHBoxLayout()
         self.sessions = QComboBox()
-        self.sessions.setMinimumWidth(350)
+        self.sessions.setPlaceholderText("暂无已保存的会话")
+        self.sessions.setMinimumWidth(260)
         self.sessions.currentIndexChanged.connect(self.open_selected)
         top.addWidget(self.sessions, 1)
-        refresh = QPushButton("刷新会话")
+        refresh = QPushButton("刷新")
         refresh.clicked.connect(self.refresh)
         top.addWidget(refresh)
         self.games = QComboBox()
+        self.games.setMinimumWidth(150)
+        self.games.addItem("全部牌局", None)
         self.games.currentIndexChanged.connect(self.render_events)
         top.addWidget(self.games)
-        for title, action in (
-            ("独立事件标注", self.independent_labels),
-            ("导出整局 JSON", self.export),
-            ("按原配置模板重算", self.analyze),
-            ("使用新模板重算", lambda: self.analyze(True)),
-        ):
-            button = QPushButton(title)
-            button.clicked.connect(action)
-            top.addWidget(button)
         layout.addLayout(top)
-        split = QSplitter(Qt.Orientation.Horizontal)
+        self.split = QSplitter(Qt.Orientation.Horizontal)
+        self.split.setHandleWidth(18)
+        preview, preview_layout = card("录像画面")
         self.canvas = FrameCanvas()
-        self.canvas.selected.connect(self.selection)
-        split.addWidget(self.canvas)
+        self.canvas.empty_text = "暂无可播放的录像"
+        preview_layout.addWidget(self.canvas, 1)
+        self.split.addWidget(preview)
         panel = QWidget()
+        panel.setObjectName("card")
         side = QVBoxLayout(panel)
+        side.setContentsMargins(16, 16, 16, 16)
+        side.setSpacing(12)
+        side.addWidget(make_label("事件与疑点", "sectionTitle"))
         self.events = QTreeWidget()
-        self.events.setHeaderLabels(["时间 / 事件", "玩家 / 牌点 / 疑点"])
-        self.events.setColumnWidth(0, 185)
+        self.events.setHeaderLabels(["时间 / 事件", "玩家 / 内容"])
+        self.events.setColumnWidth(0, 150)
         self.events.itemDoubleClicked.connect(self.jump)
+        self.events.itemSelectionChanged.connect(self.update_controls)
         side.addWidget(self.events, 1)
         actions = QHBoxLayout()
+        self.edit_button = QPushButton("修正事件")
+        self.edit_button.clicked.connect(self.edit)
+        actions.addWidget(self.edit_button, 1)
+        more = self.more_button = QPushButton("更多纠错")
+        menu = QMenu(more)
         for title, action in (
-            ("修改", self.edit),
-            ("插入", self.insert),
-            ("撤销事件", self.delete),
-            ("撤销修订", self.undo),
+            ("插入事件", self.insert),
+            ("撤销选中事件", self.delete),
+            ("撤销最近修订", self.undo),
         ):
-            button = QPushButton(title)
-            button.clicked.connect(action)
-            actions.addWidget(button)
+            menu.addAction(title, action)
+        more.setMenu(menu)
+        actions.addWidget(more)
         side.addLayout(actions)
-        self.state_label = QLabel("选择会话后显示牌局与疑点")
-        self.state_label.setWordWrap(True)
+        self.state_label = make_label("选择会话后显示牌局与疑点", "muted", wrap=True)
         side.addWidget(self.state_label)
-        split.addWidget(panel)
-        split.setSizes([880, 450])
-        layout.addWidget(split, 1)
+        panel.setMinimumWidth(320)
+        self.split.addWidget(panel)
+        self.split.setStretchFactor(0, 1)
+        self.split.setStretchFactor(1, 0)
+        self.split.setSizes([920, 350])
+        layout.addWidget(self.split, 1)
         transport = QHBoxLayout()
+        self.play = QPushButton("播放")
+        self.play.setObjectName("primary")
+        self.play.clicked.connect(self.toggle_play)
+        transport.addWidget(self.play)
+        self.frame_buttons = []
         for title, delta in (("上一帧", -1), ("下一帧", 1)):
             button = QPushButton(title)
             button.clicked.connect(lambda checked=False, d=delta: self.step(d))
             transport.addWidget(button)
-        self.play = QPushButton("播放")
-        self.play.clicked.connect(self.toggle_play)
-        transport.addWidget(self.play)
+            self.frame_buttons.append(button)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.sliderReleased.connect(
             lambda: self.seek(self.replay.start_us + self.slider.value() * 1000) if self.replay else None
         )
         transport.addWidget(self.slider, 1)
-        self.time_label = QLabel("00:00")
+        self.time_label = QLabel("00:00:00")
         transport.addWidget(self.time_label)
         layout.addLayout(transport)
-        sampling = QHBoxLayout()
-        self.mode = QComboBox()
-        for label, key in (
-            ("查看录像", "view"),
-            ("裁剪牌点模板", "card"),
-            ("裁剪标记模板", "marker"),
-            ("校准区域", "region"),
-        ):
-            self.mode.addItem(label, key)
-        self.mode.currentIndexChanged.connect(self.mode_changed)
-        sampling.addWidget(self.mode)
-        self.target = QComboBox()
-        sampling.addWidget(self.target)
-        self.label = QLineEdit()
-        self.label.setPlaceholderText("牌点或标记标签")
-        sampling.addWidget(self.label)
-        self.glyph = QDoubleSpinBox()
-        self.glyph.setRange(5, 250)
-        self.glyph.setValue(50)
-        self.glyph.setPrefix("牌点高度 ")
-        sampling.addWidget(self.glyph)
-        sample = QPushButton("标注当前帧")
-        sample.clicked.connect(self.annotate)
-        sampling.addWidget(sample)
-        layout.addLayout(sampling)
-        self.status = QLabel("双击事件或疑点跳转录像；区域校准与新模板只影响后续录制 / 新分析版本。")
-        self.status.setWordWrap(True)
+        self.status = make_label("双击事件或疑点定位录像；修订保留原始记录。", "muted", wrap=True)
         layout.addWidget(self.status)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
@@ -299,13 +304,24 @@ class SessionDialog(QDialog):
         self.play_timer = QTimer(self)
         self.play_timer.setInterval(200)
         self.play_timer.timeout.connect(self.advance)
-        self.mode_changed()
         self.refresh()
 
-    def refresh(self):
+    def update_controls(self) -> None:
+        """GUI 线程按录像和选中事件启用操作；空会话不出现可点击但无效的播放或修正。"""
+        self.play.setEnabled(self.replay is not None)
+        self.slider.setEnabled(self.replay is not None)
+        for button in self.frame_buttons:
+            button.setEnabled(self.replay is not None)
+        selected = self.selected()
+        self.edit_button.setEnabled(bool(self.session and selected and "event_id" in selected))
+        self.more_button.setEnabled(self.session is not None)
+
+    def refresh(self) -> None:
+        """GUI 线程扫描本地会话，优先保留指定路径或当前选择；后台定位期间不切换会话。"""
         if self.future:
             return
-        current = self.sessions.currentData()
+        current = self.initial_folder or self.sessions.currentData()
+        self.initial_folder = None
         self.sessions.blockSignals(True)
         self.sessions.clear()
         for database in sorted((self.store.root / "sessions").rglob("session.sqlite3"), reverse=True):
@@ -316,7 +332,8 @@ class SessionDialog(QDialog):
         self.sessions.blockSignals(False)
         self.open_selected()
 
-    def open_selected(self):
+    def open_selected(self) -> None:
+        """GUI 线程打开所选数据库和视频索引，登记后台定位；读取失败直接显示中文原因。"""
         if self.future:
             return
         self.play_timer.stop()
@@ -327,7 +344,10 @@ class SessionDialog(QDialog):
             self.session.close()
         folder = self.sessions.currentData()
         self.session = self.replay = None
+        self.events.clear()
+        self.pending_seek = None
         if folder is None:
+            self.update_controls()
             return
         try:
             self.session = SessionStore(folder)
@@ -338,6 +358,7 @@ class SessionDialog(QDialog):
             self.seek(self.replay.start_us)
         except Exception as exc:
             self.status.setText(f"会话读取失败：{exc}")
+        self.update_controls()
 
     def render_games(self):
         current = self.games.currentData()
@@ -391,19 +412,16 @@ class SessionDialog(QDialog):
         if self.replay:
             self.pending_seek = (pts, after)
 
-    def poll(self):
+    def poll(self) -> None:
+        """GUI 线程收取解码结果并只提交最新定位请求；解码异常停止播放，不访问手机。"""
         if self.future and self.future.done():
             future, self.future = self.future, None
             try:
                 result = future.result()
-                if self.job == "seek":
-                    self.frame = result
-                    self.canvas.set_frame(result)
-                    self.slider.setValue(round(self.relative(result.media_pts_us) * 1000))
-                    self.time_label.setText(f"{self.relative(result.media_pts_us):.3f} 秒")
-                else:
-                    self.status.setText(f"新分析版本已保存：{result}")
-                    self.refresh()
+                self.frame = result
+                self.canvas.set_frame(result)
+                self.slider.setValue(round(self.relative(result.media_pts_us) * 1000))
+                self.time_label.setText(duration_text(self.relative(result.media_pts_us)))
             except Exception as exc:
                 self.status.setText(str(exc))
                 self.play_timer.stop()
@@ -497,179 +515,17 @@ class SessionDialog(QDialog):
                 self.render_games()
                 self.export()
 
-    def independent_labels(self):
-        """打开独立标注窗口；不传入当前预测列表，防止人工真值被自动结果预填。"""
-        if self.session is None or self.future is not None:
-            return
-        from doudizhu_lab.ui.truth import TruthDialog
-
-        try:
-            dialog = TruthDialog(self.session.folder, self)
-            dialog.exec()
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "独立标注不可用", str(exc))
-
-    def export(self):
+    def export(self) -> None:
+        """纠错后导出派生结果；保留原始数据库记录，写盘异常通过状态文字说明。"""
         if self.session:
             try:
-                self.status.setText(f"已导出：{self.session.export()}")
+                self.session.export()
+                self.status.setText("修订已保存，原始记录保留。")
             except Exception as exc:
                 self.status.setText(f"导出失败：{exc}")
 
-    def analyze(self, updated=False):
-        if not self.session or self.future:
-            return
-        if self.session.metadata().get("status") == "recording":
-            self.status.setText("录制尚未停止；请在停止后重新分析完整会话。")
-            return
-        self.play_timer.stop()
-        self.pending_seek = None
-        self.job = "analyze"
-        self.sessions.setEnabled(False)
-        self.status.setText("正在后台重新分析，原观察与修订保留；关闭窗口可取消。")
-        self.future = self.pool.submit(
-            reanalyze,
-            self.session.folder,
-            template_root=self.store.root if updated else None,
-            cancel=self.cancel,
-        )
-
-    def mode_changed(self):
-        self.play_timer.stop()
-        self.target.clear()
-        mode = self.mode.currentData()
-        self.canvas.mode = "view" if mode == "view" else "template"
-        self.canvas.control_enabled = False
-        if mode == "card":
-            for key, label in (("hand", "手牌"), ("bottom", "底牌"), ("table", "三家出牌")):
-                self.target.addItem(label, key)
-        elif mode == "marker":
-            for key, label in MARKERS.items():
-                self.target.addItem(label, key)
-        elif mode == "region":
-            for key, label in REGION_NAMES.items():
-                self.target.addItem(label, key)
-            for key in self.store.profile.indicator_regions:
-                family, _, seat = key.partition("_")
-                label = MARKERS.get(key, MARKERS.get(family, key))
-                self.target.addItem(f"{SEAT_NAMES.get(seat, '公共')} · {label}", key)
-
-    def selection(self, area):
-        if not self.frame or not self.session:
-            return
-        mode, target = self.mode.currentData(), self.target.currentData()
-        crop = area.pixels(self.frame.width, self.frame.height).crop(self.frame.rgb)
-        game = next(
-            (
-                e["game_id"]
-                for e in reversed(self.session.effective_events())
-                if e["pts_us"] <= self.frame.media_pts_us
-            ),
-            "",
-        )
-        source = {
-            "session": self.session.metadata().get("session_id"),
-            "game": game,
-            "frame": self.frame.frame_id,
-            "pts_us": self.frame.media_pts_us,
-            "image_sha256": hashlib.sha256(self.frame.rgb.tobytes()).hexdigest(),
-            "area": asdict(area),
-        }
-        try:
-            if mode == "card":
-                ranks = parse_cards(self.label.text())
-                if len(ranks) != 1:
-                    raise ValueError("模板必须且只能填写一个牌点标签")
-                path = self.store.add_template(crop, ranks[0], target, source)
-                self.status.setText(f"牌点模板已保存：{path.name}")
-            elif mode == "marker":
-                label = self.label.text().strip()
-                if target in ("turn", "landlord", "winner"):
-                    label = "present"
-                elif target == "count" and label.isdigit():
-                    label = "n:" + label
-                elif target in ("phase", "result", "bottom_back"):
-                    label = {name: key for key, name in PHASE_NAMES.items()}.get(label, label)
-                if not label:
-                    raise ValueError(
-                        "请填写标记标签：完整剩牌数字 0～20；阶段填写发牌、叫抢地主、加倍、出牌、结算；不出文字照图填写"
-                    )
-                path = MarkerLibrary(self.store.root / "markers").add(crop, target, label, source)
-                self.status.setText(f"界面标记模板已保存：{path.name}")
-            elif mode == "region":
-                if target in self.store.profile.regions:
-                    self.store.profile.regions[target] = area
-                    self.store.profile.glyph_heights[target] = (
-                        self.glyph.value() * self.store.profile.base_height / self.frame.height
-                    )
-                else:
-                    self.store.profile.indicator_regions[target] = area
-                self.store.save()
-                self.status.setText("区域已保存到当前配置；原会话快照保持可重现。")
-        except Exception as exc:
-            self.status.setText(f"保存失败：{exc}")
-
-    def annotate(self):
-        if not self.frame:
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("独立人工标注当前帧")
-        form = QFormLayout(dialog)
-        fields = {}
-        for key, label in REGION_NAMES.items():
-            fields[key] = QLineEdit("?")
-            form.addRow(label, fields[key])
-        form.addRow(
-            QLabel(
-                "空白表示无牌；? 表示未标注（不参与该区域评分）。\n请对照原图填写，不能复制自动预测当作真值。"
-            )
-        )
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存标注")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        try:
-            labels = {
-                key: None if field.text().strip() == "?" else parse_cards(field.text())
-                for key, field in fields.items()
-            }
-            identity = hashlib.sha256(self.frame.rgb.tobytes()).hexdigest()
-            folder = self.store.root / "annotations"
-            folder.mkdir(exist_ok=True)
-            write_rgb(folder / f"{identity[:16]}.png", self.frame.rgb)
-            payload = {
-                "version": 2,
-                "frame_id": self.frame.frame_id,
-                "pts_us": self.frame.media_pts_us,
-                "source_session": self.session.metadata().get(
-                    "source_session", self.session.metadata().get("session_id")
-                ),
-                "source_game": next(
-                    (
-                        e["game_id"]
-                        for e in reversed(self.session.effective_events())
-                        if e["pts_us"] <= self.frame.media_pts_us
-                    ),
-                    None,
-                ),
-                "image_sha256": identity,
-                "regions": labels,
-                "source": "manual",
-            }
-            (folder / f"{identity[:16]}.json").write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            self.status.setText("独立标注已保存到 data/annotations；评测前请按牌局隔离模板来源。")
-        except Exception as exc:
-            self.status.setText(str(exc))
-
-    def closeEvent(self, event):
+    def closeEvent(self, event) -> None:
+        """关闭本窗口的播放定时器、后台定位和会话连接，不影响手机或其他窗口。"""
         self.cancel.set()
         self.timer.stop()
         self.play_timer.stop()

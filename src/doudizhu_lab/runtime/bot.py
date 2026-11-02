@@ -2,7 +2,7 @@
 
 import hashlib
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from time import monotonic
 
 from doudizhu_lab.agents.douzero import Agent
@@ -29,18 +29,33 @@ class InputGate:
         self.serial = threading.Lock()
         self.generation = 0
         self.owner = None
+        self.blocked = False
         self.heartbeat_at = 0.0
 
     def grant(self, owner):
         """授予单一输入所有者，旧所有者的授权同时作废。"""
         with self.lock:
             self.generation += 1
-            self.owner = owner
+            self.owner = None if self.blocked else owner
             return self.generation
 
     def revoke(self):
         """清除所有未开始输入的授权；不会阻塞 GUI 等待 ADB。"""
         return self.grant(None)
+
+    def suspend(self) -> None:
+        """立即锁住后续授权并撤销旧代号；不等待在途 USB，防止停止期间后台重新授予输入。"""
+        with self.lock:
+            self.blocked = True
+            self.generation += 1
+            self.owner = None
+
+    def allow(self) -> None:
+        """仅供用户显式开始或恢复时解除停止锁；解除本身不授予所有者，也不发送输入。"""
+        with self.lock:
+            self.blocked = False
+            self.generation += 1
+            self.owner = None
 
     def heartbeat(self):
         with self.lock:
@@ -58,6 +73,14 @@ class InputGate:
                     if not guard():
                         raise ValueError("设备、方向、前台或局面已经变化")
             client.tap(x, y, frame, max_age=1.0 if owner in ("bot", "flow") else 3.0)
+
+
+@dataclass(frozen=True)
+class ModelStatus:
+    """跨线程读取的模型加载结果；state 为 unloaded/loading/ready/failed，error 为中文原因。"""
+
+    state: str
+    error: str = ""
 
 
 class BotRuntime:
@@ -88,6 +111,7 @@ class BotRuntime:
         self._action_pipeline = None
         self._audit_session = None
         self.ready = threading.Event()
+        self._model_status = ModelStatus("unloaded")
         self.wait_since = None
         self.pause_reason = ""
 
@@ -95,13 +119,27 @@ class BotRuntime:
         """后台加载模型；重复调用不会生成第二个推理进程或任务队列。"""
         if self.thread and self.thread.is_alive():
             return
+        if self.stop_event.is_set():
+            return
+        with self.lock:
+            self._model_status = ModelStatus("loading")
         self.ready.clear()
         if not self.threaded:
-            self.agent.start()
+            try:
+                self.agent.start()
+            except Exception as exc:
+                self._model_status = ModelStatus("failed", str(exc))
+                raise
             self.ready.set()
+            self._model_status = ModelStatus("ready")
             return
         self.thread = threading.Thread(target=self._run, name="机器人协调", daemon=True)
         self.thread.start()
+
+    def model_status(self) -> ModelStatus:
+        """返回线程安全的只读加载快照；GUI 可轮询，不等待推理，也不授予设备输入。"""
+        with self.lock:
+            return self._model_status
 
     def attach(self, pipeline):
         """切换会话只保留模型，立即撤销旧输入；自动模式不能跨会话恢复。"""
@@ -201,6 +239,8 @@ class BotRuntime:
             self.status = "正在加载三种身份的 WP 模型…"
             self.agent.start()
             self.ready.set()
+            with self.lock:
+                self._model_status = ModelStatus("ready")
             self.status = "模型就绪 · 等待完整开局和自己的回合"
             while not self.stop_event.wait(0.03):
                 self.pulse()
@@ -209,6 +249,8 @@ class BotRuntime:
             self.mode = "stop"
             self.status = f"机器人暂停：{exc}"
             self.pause_reason = self.status
+            with self.lock:
+                self._model_status = ModelStatus("failed", str(exc))
         finally:
             self.ready.clear()
             self.gate.revoke()
@@ -217,6 +259,9 @@ class BotRuntime:
             if self._audit_session:
                 self._audit_session.close()
                 self._audit_session = None
+            if self.stop_event.is_set():
+                with self.lock:
+                    self._model_status = ModelStatus("unloaded")
 
     def pulse(self):
         """处理一轮最新观察；生产线程与确定性模拟共用，不在模拟中复制决策执行逻辑。"""
@@ -351,3 +396,6 @@ class BotRuntime:
             if self._audit_session:
                 self._audit_session.close()
                 self._audit_session = None
+        self.ready.clear()
+        with self.lock:
+            self._model_status = ModelStatus("unloaded")

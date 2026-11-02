@@ -157,62 +157,58 @@ class DemoPipeline:
 
 
 class DemoWindow(MainWindow):
-    """生产界面的隔离模拟子类；禁用所有手机入口，保留模式、停止和关闭的真实流程。"""
+    """复用新工作台的单局模拟器；只替换设备与录像工厂，不查询或连接手机。"""
 
     def __init__(self, store=None):
-        super().__init__(store, auto_refresh=False)
+        """先禁用所有自动设备入口，换成模拟闸门后再异步加载模型。"""
+        super().__init__(store, auto_refresh=False, auto_load_model=False, auto_preview=False)
         self.input_gate = InputGate(transport="simulation")
         self.client = None
-        self.setWindowTitle("斗地主实验室 · 离线机器人模拟（不连接手机）")
-        self.devices.addItem("本地模拟牌桌", Device("simulation", "device", "模拟器"))
-        self._lock_recording(False)
-        self.log("本地模拟器已就绪；点击开始记录创建模拟会话，再加载模型、选择单步或自动执行。")
+        self.setWindowTitle("斗地主实验室 · 离线模拟")
+        self.available_devices = [Device("simulation", "device", "本地模拟")]
+        self.selected_device = self.available_devices[0]
+        self.log("本地模拟器已就绪；模型就绪后可以开始模拟牌局。")
+        QTimer.singleShot(0, self.load_bot)
 
-    def _device_changed(self):
-        """模拟设备固定，不创建或切换任何真实设备客户端。"""
-        self.connection_label.setText("本地模拟 · 不连接手机")
-
-    def _lock_recording(self, active):
-        super()._lock_recording(active)
-        for widget in (
-            self.devices,
-            self.refresh_button,
-            self.start_button,
-            self.import_button,
-            self.settings_button,
-            self.acceptance,
-            self.replay_button,
-            self.bot_calibrate,
-        ):
-            widget.setEnabled(False)
-        self.mode.model().item(1).setEnabled(False)
-        self.continuous_start.setEnabled(False)
-
-    def create_pipeline(self):
-        """单局演示默认后端；连续演示子类只替换此工厂，GUI关闭流程保持生产实现。"""
+    def create_pipeline(self, serial: str):
+        """工作线程返回单局模拟源；serial 不会传给 ADB，构造本身不执行动作。"""
         return DemoPipeline(self.store)
 
-    def toggle_recording(self):
-        """用模拟源替换设备采集；停止仍走主窗口的取消、后台收尾和释放流程。"""
-        if self.recording:
-            return super().toggle_recording()
-        if self.busy:
+    def primary_action(self) -> None:
+        """单局演示的显式开始按钮；先记录模拟源，再明确授权单局自动执行。"""
+        if not self.bot or not self.bot.ready.is_set():
+            self.message = "请等待 WP 模型就绪后开始模拟"
+            self.render_dashboard()
             return
-        self.pause()
-        self._lock_recording(True)
-        self.record_button.setEnabled(False)
+        if not self.recording:
+            self.start_recording()
+            self._demo_auto_requested = True
 
-        def start():
-            pipeline = self.create_pipeline()
-            pipeline.start()
-            return pipeline
+    def _launch_continuous(self) -> None:
+        """模拟录像就绪后消费一次开始意图，自检通过 start_recording 保持仅建议。"""
+        super()._launch_continuous()
+        if getattr(self, "_demo_auto_requested", False) and self.recording and not self._stop_requested:
+            self._demo_auto_requested = False
+            self.set_bot_mode("auto")
 
-        self._submit("record_start", start)
+    def stop_bot(self, reason: str = "用户停止连续任务") -> None:
+        """同步取消模拟自动开始意图，再调用生产控制器撤销输入。"""
+        self._demo_auto_requested = False
+        super().stop_bot(reason)
 
-    def _done(self, generation, kind, value, error):
-        if kind == "record_start" and value:
-            self.client = value.client
-        super()._done(generation, kind, value, error)
+    def _tick(self) -> None:
+        """复用生产心跳；单局模拟自然结束时自动保存，无需连续页面识别。"""
+        super()._tick()
+        if self.recording and not self.continuous and not self._record_stopping:
+            snapshot = self.recording.bot_snapshot()
+            if snapshot and snapshot.state["ended"] and not hasattr(self, "native_check"):
+                self.stop_and_save("模拟牌局已完成", outcome="completed")
+
+    def render_dashboard(self) -> None:
+        """复用布局，只更换模拟任务名称；不创建旧模式或调试按钮。"""
+        super().render_dashboard()
+        self.action_button.setText("开始模拟牌局")
+        self.settings_button.setEnabled(False)
 
 
 class NativeCheck(QObject):
@@ -243,33 +239,33 @@ class NativeCheck(QObject):
             if monotonic() - self.started > 100 and self.stage != "收尾":
                 raise ValueError("原生模拟窗口自检超时")
             if self.stage == "启动":
-                w.record_button.click()
+                w.start_recording()
                 self.advance("加载")
             elif self.stage == "加载" and w.recording and w.recording.bot_snapshot():
                 self.pipeline = w.recording
-                w.bot_load.click()
+                w.load_bot()
                 self.advance("仅建议")
             elif self.stage == "仅建议" and w.bot and w.bot.suggestion:
                 if self.pipeline.device.taps:
                     raise ValueError("仅建议模式产生了输入")
-                w.bot_mode.setCurrentIndex(1)
+                w.set_bot_mode("step")
                 self.advance("单步")
             elif self.stage == "单步" and w.bot.executor.stage == "已确认" and w.bot.mode == "suggest":
                 self.first_turn = self.pipeline.device.tracker.state.turn
-                w.bot_mode.setCurrentIndex(2)
+                w.set_bot_mode("auto")
                 self.advance("自动")
             elif (
                 self.stage == "自动"
                 and self.pipeline.device.tracker.state.turn > self.first_turn + 2
                 and w.bot.executor.stage == "已确认"
             ):
-                w.bot_stop.click()
+                w.stop_bot()
                 self.stopped_at, self.stopped_taps = monotonic(), self.pipeline.device.taps
                 self.advance("停止核验")
             elif self.stage == "停止核验" and monotonic() - self.stopped_at > 0.6:
                 if self.pipeline.device.taps != self.stopped_taps:
                     raise ValueError("取消后仍产生新的模拟点击")
-                w.bot_mode.setCurrentIndex(2)
+                w.set_bot_mode("auto")
                 self.advance("等待结算")
             elif (
                 self.stage == "等待结算"
@@ -306,18 +302,26 @@ class NativeCheck(QObject):
     def begin_close(self):
         self.window.stop_bot()
         if self.window.recording and not self.window._record_stopping:
-            self.window.toggle_recording()
+            self.window.stop_and_save()
         self.advance("收尾")
 
 
 class ContinuousDemoWindow(DemoWindow):
     """连续流程原生演示，页面为示意观察；所有设备入口均固定为本地模拟源。"""
 
-    def _lock_recording(self, active):
-        super()._lock_recording(active)
-        self.continuous_start.setEnabled(True)
+    def primary_action(self) -> None:
+        """模拟连续任务使用生产启动及恢复流程，不调用任何真实手机后端。"""
+        MainWindow.primary_action(self)
 
-    def create_pipeline(self):
+    def render_dashboard(self) -> None:
+        """连续演示复用生产按钮状态，仅标记模拟来源。"""
+        MainWindow.render_dashboard(self)
+        self.settings_button.setEnabled(False)
+        if self.action_button.text() == "开始连续游戏":
+            self.action_button.setText("开始模拟任务")
+
+    def create_pipeline(self, serial: str):
+        """返回连续页面模拟源；工作线程调用，不创建真实手机客户端。"""
         from doudizhu_lab.simulation.continuous import ContinuousSimPipeline
 
         return ContinuousSimPipeline(self.store, threaded=True)
@@ -330,7 +334,7 @@ class ContinuousNativeCheck(QObject):
         super().__init__(window)
         self.window, self.application = window, application
         self.stage, self.started, self.history = "启动", monotonic(), []
-        self.pipeline = None
+        self.pipeline = self.runtime = None
         self.report = {
             "source": "simulation_continuous_native_ui",
             "platform": application.platformName(),
@@ -352,21 +356,21 @@ class ContinuousNativeCheck(QObject):
         try:
             if monotonic() - self.started > 100 and self.stage != "收尾":
                 raise ValueError("连续原生窗口自检超时")
-            if self.stage == "启动":
-                w.continuous_start.click()
+            if self.stage == "启动" and w.bot and w.bot.ready.is_set():
+                w.primary_action()
                 self.advance("等待出牌")
             elif self.stage == "等待出牌" and w.continuous and w.bot.executor.stage == "已确认":
-                self.pipeline = w.recording
+                self.pipeline, self.runtime = w.recording, w.continuous
                 w.continuous.pause("原生窗口自检暂停")
                 self.before, self.paused_at = self.inputs(), monotonic()
                 self.advance("暂停核验")
             elif self.stage == "暂停核验" and monotonic() - self.paused_at > 0.7:
                 if self.inputs() != self.before:
                     raise ValueError("暂停后仍出现新输入")
-                w.continuous_resume.click()
+                w.resume_continuous()
                 self.advance("恢复")
             elif self.stage == "恢复" and w.continuous.active and self.inputs() > self.before:
-                w.bot_stop.click()
+                w.stop_bot()
                 self.before, self.paused_at = self.inputs(), monotonic()
                 self.advance("停止核验")
             elif self.stage == "停止核验" and monotonic() - self.paused_at > 0.7:
@@ -382,9 +386,9 @@ class ContinuousNativeCheck(QObject):
                     duration_seconds=monotonic() - self.started,
                     worker_stopped=not (w.bot and w.bot.thread.is_alive())
                     and not (self.pipeline and self.pipeline.thread.is_alive()),
-                    continuous_stopped=not (w.continuous and w.continuous.thread.is_alive()),
+                    continuous_stopped=not (self.runtime and self.runtime.thread.is_alive()),
                     bidding_mode=w.store.profile.bid_settings["mode"],
-                    bidding_selector_locked=not w.bidding_mode.isEnabled() if w.recording else True,
+                    bidding_selector_locked=w.settings_locked if w.recording else True,
                 )
                 self.report["passed"] &= self.report["worker_stopped"] and self.report["continuous_stopped"]
                 target = w.store.root / "continuous-evaluation/原生窗口检查.json"
@@ -398,7 +402,7 @@ class ContinuousNativeCheck(QObject):
     def begin_close(self):
         self.window.stop_bot()
         if self.window.recording and not self.window._record_stopping:
-            self.window.toggle_recording()
+            self.window.stop_and_save()
         self.advance("收尾")
 
 

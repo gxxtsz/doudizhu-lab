@@ -28,6 +28,7 @@ class FrameCanvas(QWidget):
         self.profile = Profile()
         self.mode = "view"
         self.control_enabled = False
+        self.empty_text = "等待画面"
         self._drag_start: QPointF | None = None
         self._drag_end: QPointF | None = None
         self._image: QImage | None = None
@@ -77,7 +78,7 @@ class FrameCanvas(QWidget):
             painter.drawText(
                 self.rect(),
                 Qt.AlignmentFlag.AlignCenter,
-                "连接手机并开始预览\n\n也可以导入本地截图进行识别与校准",
+                self.empty_text,
             )
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)

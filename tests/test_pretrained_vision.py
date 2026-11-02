@@ -179,18 +179,16 @@ def test_real_ocr_large_hand_center_bottom_and_selected_joker_are_compatible():
 
 
 @pytest.mark.gui
-def test_gui_shows_explicit_ocr_mode_without_phone_or_implicit_execution(qtbot, tmp_path, monkeypatch):
+def test_gui_preserves_explicit_ocr_mode_without_phone_or_implicit_execution(qtbot, tmp_path):
     from doudizhu_lab.ui.window import MainWindow
 
     store = Store(tmp_path)
     store.profile.hand_classifier = "pretrained-ocr"
-    fake = Recognizer(store.template_dir, include_bundled=False)
-    monkeypatch.setattr("doudizhu_lab.ui.window.create_recognizer", lambda *a, **kw: fake)
-    window = MainWindow(store, auto_refresh=False)
+    window = MainWindow(store, auto_refresh=False, auto_load_model=False, auto_preview=False)
     qtbot.addWidget(window)
     window.show()
-    assert "免训练OCR" in window.coverage_label.text()
-    assert window.bot_mode.currentData() == "suggest"
+    assert window.store.profile.hand_classifier == "pretrained-ocr"
+    assert window.canvas.recognition is None and not window.canvas.control_enabled
     assert not window.running and window.bot is None
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())

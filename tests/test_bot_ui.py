@@ -53,23 +53,22 @@ def test_native_simulator_step_stop_record_close(qtbot, tmp_path, monkeypatch):
     window = DemoWindow(Store(tmp_path))
     qtbot.addWidget(window)
     window.show()
-    assert window.bot_mode.currentData() == "suggest"
-    qtbot.mouseClick(window.record_button, Qt.MouseButton.LeftButton)
+    window.start_recording()
     qtbot.waitUntil(lambda: window.recording is not None, timeout=5000)
     pipe = window.recording
-    qtbot.mouseClick(window.bot_load, Qt.MouseButton.LeftButton)
+    window.load_bot()
     qtbot.waitUntil(lambda: window.bot is not None and window.bot.suggestion is not None, timeout=5000)
-    assert pipe.device.taps == 0
-    qtbot.mouseClick(window.bot_execute, Qt.MouseButton.LeftButton)
+    assert window.bot.mode == "suggest" and pipe.device.taps == 0
+    window.set_bot_mode("step")
     qtbot.waitUntil(lambda: window.bot.executor.stage == "已确认", timeout=5000)
     qtbot.waitUntil(lambda: window.bot.mode == "suggest")
     assert pipe.device.taps > 0 and not pipe.device.invalid
-    window.bot_mode.setCurrentIndex(2)
-    qtbot.mouseClick(window.bot_stop, Qt.MouseButton.LeftButton)
+    window.set_bot_mode("auto")
+    window.stop_bot()
     before = pipe.device.taps
     qtbot.wait(350)
     assert pipe.device.taps == before and window.bot.mode == "stop"
-    qtbot.mouseClick(window.record_button, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(window.stop_button, Qt.MouseButton.LeftButton)
     qtbot.waitUntil(lambda: window.recording is None, timeout=5000)
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
@@ -133,7 +132,7 @@ def test_close_with_zero_elapsed_clock_does_not_raise_in_qt(qtbot, tmp_path, mon
     from doudizhu_lab.ui.window import MainWindow
 
     monkeypatch.setattr("doudizhu_lab.ui.window.monotonic", lambda: 123.0)
-    window = MainWindow(Store(tmp_path), auto_refresh=False)
+    window = MainWindow(Store(tmp_path), auto_refresh=False, auto_load_model=False, auto_preview=False)
     qtbot.addWidget(window)
     window.show()
     assert window.close()

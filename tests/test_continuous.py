@@ -732,7 +732,8 @@ def test_gui_continuous_pause_resume_stop_and_shutdown(qtbot, tmp_path, monkeypa
     window = ContinuousDemoWindow(Store(tmp_path))
     qtbot.addWidget(window)
     window.show()
-    window.continuous_start.click()
+    qtbot.waitUntil(lambda: window.bot is not None and window.bot.ready.is_set(), timeout=5000)
+    window.action_button.click()
     qtbot.waitUntil(lambda: window.continuous is not None and window.continuous.active, timeout=5000)
     runtime, pipeline = window.continuous, window.recording
     qtbot.waitUntil(lambda: len(pipeline.flow_commands) >= 1, timeout=5000)
@@ -742,10 +743,10 @@ def test_gui_continuous_pause_resume_stop_and_shutdown(qtbot, tmp_path, monkeypa
     before = len(pipeline.flow_commands)
     qtbot.wait(300)
     assert len(pipeline.flow_commands) == before
-    qtbot.waitUntil(lambda: window.continuous_resume.isEnabled())
-    window.continuous_resume.click()
+    qtbot.waitUntil(lambda: window.action_button.text() == "恢复任务")
+    window.action_button.click()
     assert runtime.active
-    window.bot_stop.click()
+    window.stop_button.click()
     before = len(pipeline.flow_commands)
     qtbot.wait(300)
     assert len(pipeline.flow_commands) == before and runtime.status == "stopped"
