@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from doudizhu_lab.domain.settings import FLOW_ROOMS, PLAY_MODEL_NAMES
+from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES
 from doudizhu_lab.ui.components import label
 from doudizhu_lab.ui.theme import STYLE
 
@@ -75,11 +75,7 @@ class SettingsDialog(QDialog):
             self.play_model.addItem("DouZero " + name, backend)
         self.play_model.setCurrentIndex(self.play_model.findData(profile.play_model))
         form.addRow("出牌模型", self.play_model)
-        self.room = QComboBox()
-        for room in ("当前", *FLOW_ROOMS):
-            self.room.addItem("沿用当前场次" if room == "当前" else room + "场", room)
-        self.room.setCurrentIndex(self.room.findData(profile.flow_room))
-        form.addRow("场次", self.room)
+        form.addRow(label("沿用当前页面，不限制玩法名称或场次等级。", "muted", wrap=True))
         self.policy = QComboBox()
         for text, value in (("严格模式", "strict"), ("唯一推断", "infer"), ("平衡模式", "balanced")):
             self.policy.addItem(text, value)
@@ -151,7 +147,6 @@ class SettingsDialog(QDialog):
         """校验并发布表单副本；保存失败直接显示中文原因，已有配置与标定保持原值。"""
         profile = deepcopy(self.window.store.profile)
         profile.play_model = self.play_model.currentData()
-        profile.flow_room = self.room.currentData()
         profile.continuous_policy = self.policy.currentData()
         profile.bid_settings["mode"] = self.bidding.currentData()
         profile.continuous_settings = {

@@ -41,7 +41,11 @@ def write_rgb(path: Path, rgb: np.ndarray) -> None:
 
 
 class Store:
-    """管理用户配置，损坏配置不静默覆盖；调用者收到错误后可以选择重置。"""
+    """管理用户配置，损坏配置不静默覆盖；调用者收到错误后可以选择重置。
+
+    读取旧配置只在内存中补齐默认值，并将已弃用的 flow_room 归为“当前”；不在
+    构造时回写文件。play_model、叫抢、任务上限及既有标定仍按原配置保留。
+    """
 
     def __init__(self, root: Path | None = None):
         self.root = resolve_data_dir(root)
@@ -77,7 +81,7 @@ class Store:
                     hand_classifier=p.get("hand_classifier", "template"),
                     play_model=p.get("play_model", "resnet"),
                     continuous_settings=p.get("continuous_settings", self.profile.continuous_settings),
-                    flow_room=p.get("flow_room", "初级"),
+                    flow_room="当前",
                     continuous_policy=p.get("continuous_policy", "strict"),
                     bid_settings=p.get("bid_settings", default_bid_settings()),
                     indicator_regions={
@@ -110,7 +114,12 @@ class Store:
                 raise ValueError(f"配置文件损坏，请备份后修复或移走：{self.settings_path}") from exc
 
     def save(self) -> None:
-        """以同目录临时文件原子替换配置，避免程序退出时留下半个 JSON 文件。"""
+        """校验并以同目录临时文件原子发布当前版本配置，写入失败时上抛 OSError。
+
+        首次升级保存前保留原版本备份，之后不覆盖该备份。flow_room 始终写成
+        “当前”，成功替换后再同步内存；调用方可在失败时回滚偏好，旧文件保持完整。
+        本接口不保存运行授权，不切场，也不创建或恢复任何输入命令。
+        """
         validate_bot_profile(self.profile)
         if self._bidding_upgrade and self.settings_path.is_file():
             backup = self.root / "settings.before-bidding.bak.json"
@@ -127,7 +136,7 @@ class Store:
                 {
                     "version": CONFIGURATION_VERSION,
                     "adb_path": self.adb_path,
-                    "profile": asdict(self.profile),
+                    "profile": asdict(self.profile) | {"flow_room": "当前"},
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -135,6 +144,8 @@ class Store:
             encoding="utf-8",
         )
         target.replace(self.settings_path)
+        # 成功发布后再规范化内存，保存失败不能改变调用方当前配置。
+        self.profile.flow_room = "当前"
         self.settings_version = CONFIGURATION_VERSION
 
     def add_template(self, rgb: np.ndarray, rank: str, group: str, source: str | dict) -> Path:

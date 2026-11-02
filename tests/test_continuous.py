@@ -23,7 +23,7 @@ from doudizhu_lab.vision.flow import FlowRecognizer
 
 
 class LegalTestAgent:
-    """固定合法策略使故障测试快速可重现；正式模拟另用真实WP权重，禁止替代。"""
+    """固定合法策略使故障测试快速可重现；正式模拟另用真实模型权重，禁止替代。"""
 
     model_id = "仅用于测试的合法策略"
 
@@ -235,11 +235,16 @@ def test_recording_without_keyframe_cannot_wait_forever_or_click(run):
     assert "关键帧" in run.runtime.reason
 
 
-def test_entering_midgame_without_verified_lobby_cannot_arm_bot(run):
+@pytest.mark.parametrize("legacy_verified", [False, True])
+def test_entering_midgame_without_confirmed_lobby_cannot_arm_bot(run, legacy_verified):
     playing(run)
-    run.runtime.mode_verified = False
+    run.runtime.lobby_confirmed = False
     run.runtime.armed_game = ""
-    run.tick()
+    run.now[0] += 0.12
+    run.pipeline.tick()
+    run.gate.heartbeat()
+    flow = replace(run.pipeline.flow_snapshot(), mode_verified=legacy_verified)
+    run.runtime.advance(flow, run.pipeline.bot_snapshot())
     assert run.runtime.status == "paused" and "大厅" in run.runtime.reason
 
 
@@ -423,7 +428,7 @@ def test_current_version_preserves_version_three_and_never_persists_authorizatio
     store.save()
     assert (tmp_path / "settings.v3.bak.json").read_text(encoding="utf8") == original
     data = json.loads(store.settings_path.read_text(encoding="utf8"))
-    assert data["version"] == 5 and data["profile"]["continuous_settings"] == {
+    assert data["version"] == 6 and data["profile"]["continuous_settings"] == {
         "max_games": 5,
         "time_limit": 1800,
     }
@@ -478,7 +483,7 @@ def test_late_bottom_and_landlord_can_complete_setup_only_before_first_action():
 
 @pytest.mark.parametrize("lobby_room", FLOW_ROOMS)
 @pytest.mark.parametrize("use_current", [False, True])
-def test_flow_ocr_requires_button_color_region_and_known_mode(monkeypatch, lobby_room, use_current):
+def test_flow_ocr_requires_button_evidence_and_ignores_legacy_room(monkeypatch, lobby_room, use_current):
     recognizer = FlowRecognizer.__new__(FlowRecognizer)
     rgb = np.full((1080, 2400, 3), 80, np.uint8)
     # 用固定OCR输出隔离测试几何及背景规则；不声称这张合成图片能被真实OCR读出。
@@ -499,10 +504,10 @@ def test_flow_ocr_requires_button_color_region_and_known_mode(monkeypatch, lobby
     rgb[900:1040, 1850:2220] = (240, 170, 30)
     calls.clear()
     result = recognizer.observe(frame, room=room)
-    assert result.scene == "lobby" and result.mode_verified and result.buttons[0].kind == "match"
-    assert len(calls) == 1  # 三个场次均走右下角快速扫描，不额外识别角色或昵称。
+    assert result.scene == "lobby" and not result.mode_verified and result.buttons[0].kind == "match"
+    assert len(calls) == 2  # 仅扫描右下角按钮和中央弹窗，不再要求场次标题或扫描昵称。
     monkeypatch.setattr(recognizer, "_text", lambda *a: words[:1])
-    assert recognizer.observe(frame, room=room).scene == "unknown"
+    assert recognizer.observe(frame, room=room).scene == "lobby"
 
 
 @pytest.mark.parametrize(
@@ -514,36 +519,45 @@ def test_flow_ocr_requires_button_color_region_and_known_mode(monkeypatch, lobby
         ("专家", "洗牌专家场", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), True),
         ("当前", "经典高级场", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), True),
         ("当前", "不洗牌高级场", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), True),
+        ("任意旧参数", "不洗牌中级场", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), True),
+        ("当前", "周末特别赛", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), True),
+        ("当前", "", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), True),
         ("初级", "洗牌高级场无法进入初级场", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), True),
         ("当前", "洗牌中级场洗牌高级场", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), True),
         ("当前", "洗牌高级场", "开始匹配", 0.84, PixelRect(1900, 930, 250, 80), True),
         ("当前", "洗牌高级场", "开始匹配", 0.99, PixelRect(900, 930, 250, 80), True),
+        ("当前", "不洗牌中级场", "开始匹配", 0.99, PixelRect(1900, 400, 250, 80), True),
         ("当前", "洗牌高级场", "开始匹配", 0.99, PixelRect(1900, 930, 250, 80), False),
         ("当前", "洗牌高级场", "开始", 0.99, PixelRect(1900, 930, 250, 80), True),
     ],
 )
-def test_lobby_cannot_match_without_selected_room_and_button_evidence(
+def test_lobby_ignores_mode_but_still_requires_button_evidence(
     monkeypatch, room, mode, label, score, box, colored
 ):
     recognizer = FlowRecognizer.__new__(FlowRecognizer)
     rgb = np.full((1080, 2400, 3), (240, 170, 30) if colored else (80, 80, 80), np.uint8)
-    words = [(label, score, box), (mode, 0.99, PixelRect(1850, 790, 330, 60))]
+    words = [(label, score, box)]
+    if mode:
+        words.append((mode, 0.99, PixelRect(1850, 790, 330, 60)))
     monkeypatch.setattr(recognizer, "_text", lambda *args: words)
     frame = Frame("offline", rgb, 0, "one", 0, "file", frame_id="one")
     result = recognizer.observe(frame, room=room)
-    assert result.scene == "unknown" and not result.buttons
+    expected = label == "开始匹配" and score >= 0.85 and box.x > 1440 and box.y > 756 and colored
+    assert result.scene == ("lobby" if expected else "unknown")
+    assert bool(result.buttons) == expected
 
 
-@pytest.mark.parametrize("lobby_room", FLOW_ROOMS)
-def test_recognized_lobby_starts_and_continues_games_without_duplicate_match(run, monkeypatch, lobby_room):
+@pytest.mark.parametrize("mode", ["洗牌初级场", "洗牌高级场", "不洗牌中级场", "经典专家场", "周末特别赛", ""])
+def test_recognized_lobby_starts_and_continues_games_without_duplicate_match(run, monkeypatch, mode):
     """合成 OCR 经生产识别器进入模拟设备，验证两帧授权、匹配及下一局衔接。"""
     run.pipeline.profile.flow_room = "当前"
     run.pipeline.profile.continuous_settings["max_games"] = run.runtime.settings["max_games"] = 2
     recognizer = FlowRecognizer.__new__(FlowRecognizer)
-    words = [
-        (f"洗牌{lobby_room}场", 0.99, PixelRect(450, 70, 100, 8)),
-        ("开始匹配", 0.99, PixelRect(460, 84, 90, 10)),
-    ]
+    # “不洗牌／中级场／开始匹配”来自本次故障的文字观察，回归仅使用合成画面。
+    words = [("开始匹配", 0.99, PixelRect(460, 84, 90, 10))]
+    if mode:
+        parts = ["不洗牌", "中级场"] if mode == "不洗牌中级场" else [mode]
+        words.extend((part, 0.99, PixelRect(450 + i * 40, 70, 80, 8)) for i, part in enumerate(parts))
     monkeypatch.setattr(recognizer, "_text", lambda *args: words)
     for index in range(2):
         run.now[0] += 0.12
@@ -559,7 +573,7 @@ def test_recognized_lobby_starts_and_continues_games_without_duplicate_match(run
         for _ in range(3):
             run.runtime.advance(run.pipeline.flow, None)
         assert len(run.pipeline.flow_commands) == index
-    assert run.runtime.mode_verified and run.pipeline.phase == "matching"
+    assert run.runtime.lobby_confirmed and run.pipeline.phase == "matching"
     for _ in range(6000):
         run.tick()
         if not run.runtime.active:
@@ -584,9 +598,12 @@ def test_health_popup_has_explicit_stop_reason_and_no_buttons(monkeypatch, text)
     assert "健康系统" in result.blocked_reason and result.scene == "unknown" and not result.buttons
 
 
-@pytest.mark.parametrize(("source", "target"), [("中级", "初级"), ("初级", "中级"), ("中级", "高级")])
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [("中级", "初级"), ("初级", "中级"), ("中级", "高级"), ("初级", "专家"), ("高级", "不洗牌大师")],
+)
 @pytest.mark.parametrize("use_current", [False, True])
-def test_room_upgrade_requires_explicit_selection_and_verified_message(
+def test_room_switch_ignores_legacy_selection_and_requires_verified_message(
     monkeypatch, source, target, use_current
 ):
     recognizer = FlowRecognizer.__new__(FlowRecognizer)
@@ -599,8 +616,9 @@ def test_room_upgrade_requires_explicit_selection_and_verified_message(
     ]
     monkeypatch.setattr(recognizer, "_text", lambda *a: words)
     frame = Frame("offline", rgb, 0, "one", 0, "file", frame_id="one")
-    refused = recognizer.observe(frame, room=source)
-    assert refused.scene == "unknown" and not refused.buttons and f"切换{target}场" in refused.blocked_reason
+    different_legacy_room = recognizer.observe(frame, room=source)
+    assert different_legacy_room.scene == "room_confirmation"
+    assert different_legacy_room.buttons[0].kind == "confirm_room"
     selected = recognizer.observe(frame, room="当前" if use_current else target)
     assert selected.scene == "room_confirmation" and selected.buttons[0].kind == "confirm_room"
     monkeypatch.setattr(recognizer, "_text", lambda *a: words[-1:])
@@ -611,7 +629,11 @@ def test_room_upgrade_requires_explicit_selection_and_verified_message(
     "message",
     [
         "已为您切换",
-        "已为您切换至专家场",
+        "已为您切换至其他场次",
+        "已为您切换至未知模式",
+        "已为您切换至新场次",
+        "已为您切换到房间",
+        "已为您切换至中级场或高级场",
         "已为您切换至中级场已为您切换至高级场",
         "中级场已为您切换请确认",
         "已为您切换至高级场已为您切换",
@@ -628,6 +650,65 @@ def test_room_switch_unknown_or_conflicting_target_blocks_confirmation(monkeypat
     frame = Frame("offline", rgb, 0, "one", 0, "file", frame_id="one")
     result = recognizer.observe(frame, room="当前")
     assert result.scene == "unknown" and not result.buttons and "无法确认" in result.blocked_reason
+
+
+@pytest.mark.parametrize("target", ["专家场", "不洗牌中级场", "经典模式", "周末特别赛", "不洗牌", "VIP9区"])
+@pytest.mark.parametrize("prefix", ["已为您切换至", "已为您切换到"])
+def test_any_explicit_room_target_and_free_balance_notice_can_be_confirmed(monkeypatch, target, prefix):
+    recognizer = FlowRecognizer.__new__(FlowRecognizer)
+    frame = Frame("offline", np.full((1080, 2400, 3), (230, 175, 65), np.uint8), 0, "one", 0, "file")
+    words = [
+        (f"当前欢乐豆不足{prefix}{target}请确认", 0.99, PixelRect(700, 470, 900, 50)),
+        ("确定", 0.99, PixelRect(1160, 750, 80, 40)),
+        ("开始匹配", 0.99, PixelRect(1900, 930, 250, 80)),
+    ]
+    monkeypatch.setattr(recognizer, "_text", lambda *args: words)
+    result = recognizer.observe(frame, room="与目标无关的旧场次参数")
+    assert result.scene == "room_confirmation" and not result.blocked_reason
+    assert [b.kind for b in result.buttons] == ["confirm_room"]
+
+
+@pytest.mark.parametrize("notice", ["充值", "购买", "支付", "补充欢乐豆", "健康系统"])
+def test_central_blocking_popup_is_checked_even_with_match_button_visible(monkeypatch, notice):
+    recognizer = FlowRecognizer.__new__(FlowRecognizer)
+    frame = Frame("offline", np.full((1080, 2400, 3), (230, 175, 65), np.uint8), 0, "one", 0, "file")
+    offsets = []
+
+    def text(rgb, offset):
+        offsets.append(offset)
+        if offset == (1536, 756):
+            return [("开始匹配", 0.99, PixelRect(1900, 930, 250, 80))]
+        if offset == (600, 432):
+            return [
+                (f"已为您切换到专家场请{notice}", 0.99, PixelRect(700, 470, 900, 50)),
+                ("确定", 0.99, PixelRect(1160, 750, 80, 40)),
+            ]
+        return []
+
+    monkeypatch.setattr(recognizer, "_text", text)
+    result = recognizer.observe(frame)
+    assert offsets == [(1536, 756), (600, 432)]
+    assert result.scene == "unknown" and result.blocked_reason and not result.buttons
+
+
+@pytest.mark.parametrize(
+    "failure", ["no_target", "no_confirm", "gray_confirm", "low_score", "partial_target"]
+)
+def test_balance_notice_needs_complete_confident_target_and_visible_confirm(monkeypatch, failure):
+    recognizer = FlowRecognizer.__new__(FlowRecognizer)
+    rgb = np.full((1080, 2400, 3), (230, 175, 65), np.uint8)
+    words = [("余额不足", 0.99, PixelRect(700, 450, 900, 40))]
+    if failure != "no_target":
+        words.append(("已为您切换至不洗牌中", 0.99, PixelRect(700, 500, 700, 40)))
+        words.append(("级场", 0.8 if failure == "partial_target" else 0.99, PixelRect(1400, 500, 100, 40)))
+    if failure != "no_confirm":
+        words.append(("确定", 0.8 if failure == "low_score" else 0.99, PixelRect(1160, 750, 80, 40)))
+    if failure == "gray_confirm":
+        rgb[700:850, 1000:1400] = 80
+    words.append(("开始匹配", 0.99, PixelRect(1900, 930, 250, 80)))
+    monkeypatch.setattr(recognizer, "_text", lambda *args: words)
+    result = recognizer.observe(Frame("offline", rgb, 0, "one", 0, "file"))
+    assert result.scene == "unknown" and result.blocked_reason and not result.buttons
 
 
 @pytest.mark.parametrize("target", FLOW_ROOMS)

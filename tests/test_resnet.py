@@ -174,7 +174,7 @@ def test_v4_config_upgrade_backup_and_model_validation(tmp_path):
     store.profile.play_model = "wp"
     store.save()
     assert (tmp_path / "settings.v4.bak.json").read_text(encoding="utf8") == original
-    assert Store(tmp_path).profile.play_model == "wp" and store.settings_version == 5
+    assert Store(tmp_path).profile.play_model == "wp" and store.settings_version == 6
     profile = Profile(play_model="unknown")
     with pytest.raises(ValueError, match="出牌模型"):
         validate_bot_profile(profile)

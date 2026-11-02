@@ -453,7 +453,7 @@ class GameTracker:
                         self._counts.update(setup["remaining"])
             known_bottom = bottom or self.state.bottom
             if role and not self._role_initialized and not self.state.capture_incomplete:
-                # 普通洗牌公开规则给出开局张数，绝不推测对手牌点。
+                # 现有标准54张牌规则给出开局张数，绝不推测对手牌点。
                 initial = {s: 20 if s == role else 17 for s in SEATS}
                 setup["remaining"] = initial
                 self._counts = dict(initial)

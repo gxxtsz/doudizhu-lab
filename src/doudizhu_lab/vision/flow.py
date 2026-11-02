@@ -10,7 +10,6 @@ import cv2
 import numpy as np
 
 from doudizhu_lab.domain.models import Frame, PixelRect
-from doudizhu_lab.domain.settings import FLOW_ROOMS
 from doudizhu_lab.vision.ocr import make_ocr
 
 SCENE_NAMES = {
@@ -25,7 +24,7 @@ SCENE_NAMES = {
     "showcase": "战绩展示",
     "ending": "结算动画等待按钮",
     "unknown": "页面待确认",
-    "room_confirmation": "已选场次确认",
+    "room_confirmation": "场次切换确认",
 }
 LABELS = {
     "开始匹配": "match",
@@ -73,6 +72,7 @@ class FlowObservation:
     buttons: tuple[FlowButton, ...] = ()
     texts: tuple[str, ...] = ()
     blocked_reason: str = ""
+    # 已弃用：仅兼容旧调用和原始记录；新观察保持默认值，不参与任何运行判断。
     mode_verified: bool = False
     feedbacks: tuple[str, ...] = ()
     # 叫抢输入只能使用本帧完整手牌；不能拼接之后翻开的底牌或最新其他帧的识别。
@@ -87,14 +87,60 @@ def compact(text: str) -> str:
     return re.sub(r"[\s·：:，,。！!、_\-—]", "", text)
 
 
-def _lobby_mode_verified(text: str, room: str) -> bool:
-    """核对同帧 OCR 拼接文本中的完整洗牌场次标题，返回是否符合场次设置。
+def room_change_target(text: str) -> str | None:
+    """提取同帧明确且唯一的游戏切场目标；不限制玩法名称、等级，不产生任何输入。
 
-    “洗牌”与“无法进入初级场”等无关描述不能拼成授权；多个不同的标题视为冲突，
-    不洗牌模式也不在支持范围。调用者仅合并本次扫描的文字，本函数不访问设备。
+    输入是按 OCR 顺序拼接的同帧文字。每条“已为您切换”都必须带“至/到”和具体
+    名称；用普通按钮、提示结束语或标点分隔目标，不要求名称以“场/模式”结尾。
+    多条提示必须指向同一目标；目标缺失、冲突或仅写“其他/未知”等泛称时返回
+    None。不把提示之前的原场次描述当作目标，也不猜测 OCR 近似字。
     """
-    detected = {r for r in FLOW_ROOMS if f"洗牌{r}场" in text}
-    return "不洗牌" not in text and len(detected) == 1 and (room == "当前" or room in detected)
+    clauses = text.split("已为您切换")[1:]
+    if not clauses:
+        return None
+    targets = []
+    for clause in clauses:
+        if not clause.startswith(("至", "到")):
+            return None
+        target = re.split(
+            r"确定|开始匹配|请(?:您)?(?:确认|点击|选择)|祝(?:您)?游戏愉快|[。！!，,；;|]",
+            clause[1:],
+            maxsplit=1,
+        )[0]
+        if not re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9]{1,32}", target):
+            return None
+        if target in {
+            "场",
+            "场次",
+            "模式",
+            "房间",
+            "新场次",
+            "新模式",
+            "新房间",
+            "新的场次",
+            "新的模式",
+            "新的房间",
+        }:
+            return None
+        if any(
+            word in target
+            for word in (
+                "其他",
+                "其它",
+                "未知",
+                "某个",
+                "某场",
+                "合适",
+                "适合",
+                "相应",
+                "或者",
+                "还是",
+                "任选",
+            )
+        ) or re.search(r"(?:场|模式)(?:或|和|及|与)", target):
+            return None
+        targets.append(target)
+    return targets[0] if len(set(targets)) == 1 else None
 
 
 def select_flow_source(snapshot, decoded: Frame | None, *, now=None):
@@ -147,8 +193,9 @@ class FlowRecognizer:
     def _words(self, frame, phase, room):
         """返回带原图坐标的 OCR 候选，仅扫描按钮、场次和页面标题。
 
-        room 使用与配置相同的场次范围；右下角已确认洗牌场次与按钮时立即返回，
-        避免高级大厅继续扫描昵称、角色和排行榜而让输入证据过期。不发送设备输入。
+        room 仅兼容旧调用，不影响扫描。右下角确认“开始匹配”后再扫描中央弹窗，
+        保留充值、健康提示及切场确认的证据，随后跳过昵称和排行榜等昂贵区域。
+        不要求任何玩法或场次标题，不发送设备输入。
         """
 
         def crop(x, y, w, h):
@@ -159,7 +206,6 @@ class FlowRecognizer:
             )
 
         words = list(crop(0.64, 0.70, 0.35, 0.29))
-        labels = "".join(t for t, _, _ in words)
         footer_labels = {t for t, score, box in words if score >= 0.95 and self._colored(frame, box)}
         if {"继续", "分享"} <= footer_labels or ("退出" in footer_labels and "继续游戏" in footer_labels):
             # 大幅连胜海报的中部大字识别可超过1秒；底部两个有色按钮已足以确认页面，
@@ -175,7 +221,19 @@ class FlowRecognizer:
             and self._colored(frame, box)
             for t, score, box in words
         )
-        if footer_button and (_lobby_mode_verified(labels, room) or phase == "settlement"):
+        match_button = any(
+            t == "开始匹配"
+            and score >= 0.85
+            and 0.6 < (box.x + box.width / 2) / frame.width < 1
+            and 0.7 < (box.y + box.height / 2) / frame.height < 1
+            and self._colored(frame, box)
+            for t, score, box in words
+        )
+        if match_button:
+            # 即使匹配按钮在弹窗背后仍可见，也必须先识别中央的阻断或确认提示。
+            words += crop(0.25, 0.4, 0.5, 0.37)
+            return list({(t, b.x, b.y, b.width, b.height): (t, s, b) for t, s, b in words}.values())
+        if footer_button and phase == "settlement":
             return words
         words += crop(0.25, 0.4, 0.5, 0.37)
         if phase in ("bidding", "dealing", "unknown"):
@@ -204,13 +262,13 @@ class FlowRecognizer:
         outside[by : by + box.height, bx : bx + box.width] = False
         return bool(outside.any() and np.mean(color[outside]) > 0.45)
 
-    def observe(self, frame, table=None, *, room="初级", deal_id="", ended=False):
+    def observe(self, frame, table=None, *, room="当前", deal_id="", ended=False):
         """只读识别当前源帧，返回与 frame 绑定的 FlowObservation，不发送设备输入。
 
         table 仅在 frame_id 相同时提供阶段和手牌证据；deal_id、ended 只提示结算扫描。
-        room 接受初、中、高级或“当前”，明确选择时只能匹配该场次；“当前”沿用
-        FLOW_ROOMS 中的洗牌场次。切换弹窗必须明确写出目标且符合选择，否则返回
-        带中文阻断原因的观察。按钮仍需独立通过文字分数、区域及底色校验。
+        room 仅为旧接口兼容而保留，任何参数值均不限制玩法和场次。大厅只根据明确
+        匹配按钮识别；切场弹窗必须给出唯一明确目标，充值或购买提示始终阻断。
+        按钮仍须独立通过文字分数、区域及底色校验。
         实例由流程识别线程独占；出牌阶段仅检查托管区域，OCR 初始化或推理异常上抛。
         """
         table = table or {}
@@ -264,14 +322,14 @@ class FlowRecognizer:
                 if any(
                     w in t
                     for w in (
-                        "豆不足",
-                        "欢乐豆不足",
                         "充值",
                         "实名认证",
                         "重新登录",
                         "网络连接异常",
-                        "购买并",
+                        "购买",
+                        "支付",
                         "补充欢乐豆",
+                        "补充福豆",
                     )
                 )
             ),
@@ -282,27 +340,22 @@ class FlowRecognizer:
                 frame, "unknown", texts=texts, blocked_reason=f"需要人工处理页面：{blocked}"
             )
         confirmation_text = "".join(texts)
-        mode_verified = _lobby_mode_verified(confirmation_text, room)
         # OCR 可能把提示分成多行；只拼接同帧文本，不从“无法进入初级场”等来源描述
-        # 猜目标。每条“已为您切换”都必须跟随明确的“至/到某场”，且目标一致。
+        # 猜目标。低置信度文字不能通过拼接后留下的半个名称获得确认授权。
         room_confirmation = "已为您切换" in confirmation_text
         if room_confirmation:
-            targets = re.findall(r"已为您切换(?:至|到)(?:洗牌)?([\u4e00-\u9fff]{1,8}?)场", confirmation_text)
+            confident_text = "".join(t for t, score, _ in words if score >= 0.85)
+            target = room_change_target(confident_text)
             if (
-                len(targets) != confirmation_text.count("已为您切换")
-                or len(set(targets)) != 1
-                or targets[0] not in FLOW_ROOMS
+                target is None
+                or target != room_change_target(confirmation_text)
+                or confident_text.count("已为您切换") != confirmation_text.count("已为您切换")
             ):
-                return FlowObservation(
-                    frame, "unknown", texts=texts, blocked_reason="无法确认切换后的受支持洗牌场次，请人工确认"
-                )
-            approved = FLOW_ROOMS if room == "当前" else (room,)
-            if targets[0] not in approved:
                 return FlowObservation(
                     frame,
                     "unknown",
                     texts=texts,
-                    blocked_reason=f"游戏要求切换{targets[0]}场，当前选择为{room}场，不能自动确认",
+                    blocked_reason="无法确认切换后的唯一目标场次或玩法，请人工确认",
                 )
         matching = any(
             w in joined for w in ("匹配中", "正在匹配", "取消匹配", "寻找玩家", "对局开启中", "对局开启")
@@ -326,6 +379,20 @@ class FlowRecognizer:
             if in_region and self._colored(frame, box):
                 raw.append(FlowButton(kind, label, box, True, score))
         kinds = {b.kind for b in raw}
+        if room_confirmation and "confirm_room" not in kinds:
+            return FlowObservation(
+                frame,
+                "unknown",
+                texts=texts,
+                blocked_reason="切场提示缺少可验证的普通确认按钮，请人工确认",
+            )
+        insufficient = next(
+            (t for t in texts if any(w in t for w in ("豆不足", "余额不足", "金币不足", "筹码不足"))), ""
+        )
+        if insufficient and not (room_confirmation and "confirm_room" in kinds):
+            return FlowObservation(
+                frame, "unknown", texts=texts, blocked_reason=f"需要人工处理页面：{insufficient}"
+            )
         feedbacks = tuple(
             {
                 LABELS[t]
@@ -366,7 +433,7 @@ class FlowRecognizer:
             scene = "room_confirmation"
         elif matching:
             scene = "matching"
-        elif "match" in kinds and mode_verified:
+        elif "match" in kinds:
             scene = "lobby"
         elif kinds & {"decline_bid", "call_landlord", "rob_landlord"} and phase in (
             "bidding",
@@ -451,7 +518,6 @@ class FlowRecognizer:
             scene,
             buttons,
             texts,
-            mode_verified=mode_verified,
             feedbacks=feedbacks,
             bid_hand=tuple(hand) if hand is not None else None,
             bid_markers=tuple(markers),

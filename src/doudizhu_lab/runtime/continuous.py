@@ -32,6 +32,8 @@ class ContinuousRuntime:
 
     pipeline 必须已录制，并提供同帧 flow_snapshot/bot_snapshot；bot 是生产单局协调器。
     start 不授予跨重启权限。暂停只撤销后续输入；已发命令保留在途记录，不能撤回。
+    lobby_confirmed 仅记录本任务观察过有效大厅按钮，不读取旧 mode_verified 字段，
+    不按玩法名称或场次等级授权；完整开局、稳定帧和提交确认仍由生产流程校验。
     """
 
     def __init__(self, root, gate, bot, pipeline, *, clock=monotonic, threaded=True, bid_agent=None):
@@ -52,7 +54,8 @@ class ContinuousRuntime:
         self.candidate = None
         self.started = self.scene_since = self.clock()
         self.identity = None
-        self.mode_verified = False
+        # 仅记录是否观察到有效大厅入口，不验证玩法名称或场次等级，也不跨任务恢复。
+        self.lobby_confirmed = False
         self._finish_wait = None
         self._ready_since = None
         self.close_window_requested = False
@@ -428,8 +431,8 @@ class ContinuousRuntime:
                     self.pause("匹配等待超过120秒")
                 return
             if flow.scene == "playing":
-                if not self.mode_verified:
-                    self.pause("连续任务须从已确认场次的大厅开始，不能中途接管未知牌局")
+                if not self.lobby_confirmed:
+                    self.pause("连续任务须从已确认的大厅入口开始，不能中途接管未知牌局")
                     return
                 self._playing(snapshot)
                 return
@@ -443,10 +446,10 @@ class ContinuousRuntime:
                 if self._limited():
                     self._complete("已达到局数或时间上限，不再匹配")
                     return
-                if not flow.mode_verified:
-                    self.pause("无法确认经典洗牌与当前场次")
+                if not any(button.kind == "match" and button.enabled for button in flow.buttons):
+                    self.candidate = None
                     return
-                self.mode_verified = True
+                self.lobby_confirmed = True
             if flow.scene in ("settlement", "showcase", "ending") and self._limited():
                 self._complete("当前局结束，已达到局数或时间上限")
                 return
@@ -479,7 +482,7 @@ class ContinuousRuntime:
                     )
                 )
                 preferences["bidding"] = (bid_decision.kind,)
-            if flow.scene == "settlement" and not self.mode_verified:
+            if flow.scene == "settlement" and not self.lobby_confirmed:
                 preferences["settlement"] = ("return_lobby",)
             button = next(
                 (
@@ -493,12 +496,12 @@ class ContinuousRuntime:
             if button is None:
                 self.candidate = None
                 return
-            if not self.mode_verified and button.kind not in (
+            if not self.lobby_confirmed and button.kind not in (
                 "return_lobby",
                 "confirm_room",
                 "close_showcase",
             ):
-                self.pause("任务必须先从已确认场次的大厅开始")
+                self.pause("任务必须先从已确认的大厅入口开始")
                 return
             opportunity = (
                 bid_decision.opportunity

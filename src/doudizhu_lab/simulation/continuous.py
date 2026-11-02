@@ -230,7 +230,6 @@ class ContinuousSimPipeline:
                 self.frame,
                 self.phase,
                 buttons,
-                mode_verified=self.phase == "lobby",
                 bid_hand=self.bid_hand if self.bid_enabled and self.phase == "bidding" else None,
                 bid_deal_id=self.bid_deal_id if self.bid_enabled else "",
             )

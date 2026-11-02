@@ -178,7 +178,6 @@ class RecordingPipeline:
                     result = recognizer.observe(
                         frame,
                         table,
-                        room=self.profile.flow_room,
                         deal_id=deal_id,
                         ended=ended,
                     )

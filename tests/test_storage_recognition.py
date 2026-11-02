@@ -1,8 +1,10 @@
 """覆盖本地文件、保守拒识、牌点颜色、重复计数和真实截图回归。"""
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
+from pathlib import Path
 from time import monotonic
+from unittest.mock import Mock
 
 import cv2
 import numpy as np
@@ -19,24 +21,75 @@ DATA = local_data_root() / "validation"
 
 
 @pytest.mark.parametrize("room", [*FLOW_ROOMS, "当前"])
-def test_flow_room_configuration_roundtrip_preserves_defaults_and_format(tmp_path, room):
+def test_flow_room_legacy_values_are_normalized_to_current(tmp_path, room):
     store = Store(tmp_path)
-    assert store.profile.flow_room == "初级"
+    assert store.profile.flow_room == "当前"
     store.profile.flow_room = room
     store.save()
     restored = Store(tmp_path)
-    assert restored.profile.flow_room == room
+    assert restored.profile.flow_room == store.profile.flow_room == "当前"
     assert restored.profile.continuous_settings == {"max_games": 5, "time_limit": 1800}
     assert restored.profile.bid_settings["mode"] == "disabled"
-    assert json.loads(store.settings_path.read_text(encoding="utf8"))["version"] == 5
+    assert json.loads(store.settings_path.read_text(encoding="utf8"))["version"] == 6
 
 
-def test_flow_room_configuration_rejects_unsupported_room(tmp_path):
+def test_flow_room_no_longer_rejects_unknown_room_name(tmp_path):
     store = Store(tmp_path)
     store.profile.flow_room = "专家"
-    with pytest.raises(ValueError, match="场次"):
+    store.save()
+    assert Store(tmp_path).profile.flow_room == "当前"
+
+
+@pytest.mark.parametrize("room", ["初级", "不洗牌中级场", "专家", None])
+def test_v5_config_upgrade_backs_up_original_once_and_preserves_preferences(tmp_path, room):
+    store = Store(tmp_path)
+    profile = asdict(store.profile)
+    profile.update(flow_room=room, play_model="wp", threshold=0.91, continuous_policy="balanced")
+    profile["bid_settings"]["mode"] = "model"
+    original = json.dumps({"version": 5, "profile": profile}, ensure_ascii=False)
+    store.settings_path.write_text(original, encoding="utf8")
+    loaded = Store(tmp_path)
+    assert loaded.settings_version == 5 and loaded.profile.flow_room == "当前"
+    assert loaded.settings_path.read_text(encoding="utf8") == original
+    assert not (tmp_path / "settings.v5.bak.json").exists()
+    loaded.save()
+    assert loaded.settings_version == 6
+    backup = tmp_path / "settings.v5.bak.json"
+    assert backup.read_text(encoding="utf8") == original
+    saved = json.loads(loaded.settings_path.read_text(encoding="utf8"))
+    assert saved["profile"] == profile | {"flow_room": "当前"}
+    loaded.profile.continuous_settings["max_games"] = 7
+    loaded.save()
+    assert backup.read_text(encoding="utf8") == original
+
+
+def test_failed_save_does_not_publish_flow_room_normalization(tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    store.save()
+    before = store.settings_path.read_bytes()
+    store.profile.flow_room = "任意旧场次"
+    monkeypatch.setattr(Path, "replace", Mock(side_effect=OSError("磁盘不可写")))
+    with pytest.raises(OSError, match="磁盘不可写"):
         store.save()
-    assert not store.settings_path.exists()
+    assert store.profile.flow_room == "任意旧场次" and store.settings_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("room", ["初级", "当前", "不洗牌中级场", "任意旧脚本参数"])
+def test_legacy_flow_room_cli_accepts_any_value_without_saving(tmp_path, monkeypatch, room):
+    import sys
+
+    from doudizhu_lab.cli import app
+
+    store = Store(tmp_path)
+    store.save()
+    before = store.settings_path.read_bytes()
+    profiles = []
+    monkeypatch.setattr(sys, "argv", ["ddz-lab", "--data-dir", str(tmp_path), "--flow-room", room])
+    monkeypatch.setattr(app, "QApplication", Mock(return_value=Mock()))
+    monkeypatch.setattr(app, "MainWindow", lambda config, **kw: profiles.append(config.profile) or Mock())
+    app.main()
+    assert len(profiles) == 1 and profiles[0].flow_room == "当前"
+    assert profiles[0].play_model == "resnet" and store.settings_path.read_bytes() == before
 
 
 def test_chinese_paths_and_export_are_bound_to_same_frame(tmp_path, frame):

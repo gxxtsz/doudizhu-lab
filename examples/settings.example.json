@@ -1,8 +1,9 @@
 {
-  "version": 5,
+  "version": 6,
   "profile": {
     "name": "示例牌桌 · 2400×1080",
     "play_model": "resnet",
+    "flow_room": "当前",
     "base_width": 2400,
     "base_height": 1080
   }

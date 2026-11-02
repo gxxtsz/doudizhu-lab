@@ -78,6 +78,7 @@ class RunStore:
             "buttons": [asdict(b) for b in flow.buttons],
             "texts": flow.texts,
             "blocked_reason": flow.blocked_reason,
+            # 仅保存旧观察字段以兼容历史格式，不代表新任务要求或执行过玩法校验。
             "mode_verified": flow.mode_verified,
             "feedbacks": flow.feedbacks,
             "bid_hand": flow.bid_hand,

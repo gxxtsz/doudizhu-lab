@@ -339,7 +339,7 @@ class MainWindow(QMainWindow):
             self.continuous = ContinuousRuntime(self.store.root, self.input_gate, self.bot, self.recording)
             self.continuous.start()
             self.task_status, self.message = "running", ""
-            self.log("连续任务已开始，正在核对画面与场次")
+            self.log("连续任务已开始，正在确认当前大厅入口")
         except (OSError, ValueError, RuntimeError) as exc:
             self.stop_and_save(f"连续任务启动失败：{exc}", outcome="failed")
 
@@ -760,7 +760,7 @@ class MainWindow(QMainWindow):
         profile = self.store.profile
         policy = {"strict": "严格", "infer": "唯一推断", "balanced": "平衡"}[profile.continuous_policy]
         bidding = "模型叫抢" if profile.bid_settings["mode"] == "model" else "不叫不抢"
-        self.policy_label.setText(f"{profile.flow_room}场次 · {policy}模式 · {bidding}")
+        self.policy_label.setText(f"沿用当前页面 · {policy}模式 · {bidding}")
         self.role_label.setText("身份　" + state.role)
         self.actor_label.setText("行动　" + state.actor)
         self.remaining_label.setText("剩牌　自己 {} · 左侧 {} · 右侧 {}".format(*state.remaining))

@@ -282,15 +282,18 @@ def test_settings_roundtrip_preserves_calibration_and_seconds(window, qtbot):
     dialog = SettingsDialog(window)
     qtbot.addWidget(dialog)
     dialog.show()
-    dialog.room.setCurrentIndex(dialog.room.findData("高级"))
+    assert not hasattr(dialog, "room")
+    assert any("沿用当前页面" in item.text() for item in dialog.findChildren(QLabel))
+    window.render_dashboard()
+    assert window.policy_label.text().startswith("沿用当前页面 · ")
     dialog.policy.setCurrentIndex(dialog.policy.findData("balanced"))
     dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
     dialog.games.setValue(7)
     dialog.time_limit.setTime(QTime(0, 12, 34))
     dialog.save()
     saved = Store(window.store.root)
-    assert saved.settings_version == 5 and saved.profile.bot_controls == before
-    assert saved.profile.flow_room == "高级" and saved.profile.continuous_settings == {
+    assert saved.settings_version == 6 and saved.profile.bot_controls == before
+    assert saved.profile.flow_room == "当前" and saved.profile.continuous_settings == {
         "max_games": 7,
         "time_limit": 754,
     }
