@@ -10,12 +10,19 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from doudizhu_lab import __version__
 from doudizhu_lab.cli.console import configure_console
+from doudizhu_lab.domain.settings import FLOW_ROOMS
 from doudizhu_lab.storage.config import Store
 from doudizhu_lab.ui.window import MainWindow
 
 
 def main() -> None:
-    """启动桌面程序；--data-dir 用于隔离测试数据，--preview 用于连续预览验收。"""
+    """在 GUI 主线程解析命令行并启动窗口；正常关闭后返回 None。
+
+    --data-dir 用于隔离测试数据，--preview 用于只读预览；--flow-room 接受明确的
+    洗牌场次或“当前”，后者沿用初、中、高级场。该偏好本身不启动匹配或授予输入。
+    只有用户显式启动连续游戏后，窗口才准备模型和录像并申请输入；参数错误由
+    argparse 以 SystemExit 拒绝，配置加载错误通过中文对话框说明后退出。
+    """
     configure_console()
     parser = argparse.ArgumentParser(description="斗地主实验室")
     parser.add_argument("--data-dir", type=Path, help="本地运行数据目录")
@@ -27,7 +34,9 @@ def main() -> None:
     parser.add_argument("--preview", action="store_true", help="仅一台授权设备时自动开始只读预览")
     parser.add_argument("--record", action="store_true", help="仅一台授权设备时自动开始整局记录")
     parser.add_argument(
-        "--flow-room", choices=("初级", "中级", "当前"), help="当前表示沿用已授权的初级/中级场次"
+        "--flow-room",
+        choices=(*FLOW_ROOMS, "当前"),
+        help=f"当前表示沿用已授权的{'/'.join(FLOW_ROOMS)}洗牌场次",
     )
     parser.add_argument(
         "--continuous", action="store_true", help="显式启动连续游戏，默认5局或30分钟；需要vision依赖"

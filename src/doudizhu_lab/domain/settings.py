@@ -6,6 +6,9 @@ import numpy as np
 
 from doudizhu_lab.domain.models import NormalizedRect, TrackerSettings
 
+# 连续流程只授权这些洗牌场次；配置、命令行和视觉扫描共用，避免“当前”漏掉高级场。
+FLOW_ROOMS: tuple[str, ...] = ("初级", "中级", "高级")
+
 
 def default_bid_settings() -> dict[str, str | float]:
     """旧配置默认仍不叫抢；显式选模型后使用分别可调的首叫、抢地主及回抢阈值。
@@ -96,7 +99,12 @@ class Profile:
 
 
 def validate_bot_profile(profile: Profile) -> None:
-    """检验操作布局与超时上限；旧版缺省可保持未标定，禁止负数、非有限值及宽松超时。"""
+    """只读检验配置，合法时返回 None，字段无效时抛出 ValueError。
+
+    profile 可保持未完成的操作标定，但不能含负数、非有限值或放宽后的超时。
+    flow_room 必须为已支持的洗牌场次或“当前”；“当前”仅允许沿用 FLOW_ROOMS。
+    本函数不修改配置、不访问设备，可在加载配置或 GUI 保存前调用，不授予输入权限。
+    """
     if profile.hand_classifier not in ("template", "pretrained-ocr"):
         raise ValueError("手牌分类器配置无效")
     settings = profile.continuous_settings
@@ -112,8 +120,8 @@ def validate_bot_profile(profile: Profile) -> None:
         raise ValueError("稳健叫抢策略要求首叫阈值不高于抢地主及回抢阈值")
     if profile.continuous_policy not in ("strict", "infer", "balanced"):
         raise ValueError("连续策略必须为严格、唯一推断或平衡模式")
-    if profile.flow_room not in ("初级", "中级", "当前"):
-        raise ValueError("当前只支持初级、中级，或沿用这两个已授权场次中的当前场次")
+    if profile.flow_room not in (*FLOW_ROOMS, "当前"):
+        raise ValueError(f"场次必须为{'、'.join(FLOW_ROOMS)}，或沿用这些洗牌场次的当前场次")
     if set(settings) != {"max_games", "time_limit"} or any(
         type(settings[k]) is not int or not 0 < settings[k] <= limit
         for k, limit in (("max_games", 30), ("time_limit", 14400))

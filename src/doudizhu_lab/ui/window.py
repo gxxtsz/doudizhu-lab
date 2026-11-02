@@ -873,7 +873,10 @@ class MainWindow(QMainWindow):
             return
         self.continuous = ContinuousRuntime(self.store.root, self.input_gate, self.bot, self.recording)
         self.continuous.start()
-        self.log(f"连续任务已准备：{self.continuous.store.folder}；等待模型及已确认的经典洗牌大厅")
+        self.log(
+            f"连续任务已准备：{self.continuous.store.folder}；等待模型及已确认的洗牌大厅，"
+            f"场次设置：{self.store.profile.flow_room}"
+        )
 
     def resume_continuous(self):
         """明确恢复按钮；无法恢复的历史缺口保留，不自动重置可信状态。"""

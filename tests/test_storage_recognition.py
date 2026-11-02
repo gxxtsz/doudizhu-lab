@@ -9,12 +9,34 @@ import numpy as np
 import pytest
 
 from doudizhu_lab.domain.models import RANKS, Frame, Recognition, RegionStatus
+from doudizhu_lab.domain.settings import FLOW_ROOMS
 from doudizhu_lab.evaluation.cards import evaluate
 from doudizhu_lab.storage.config import Store, read_rgb, write_rgb
 from doudizhu_lab.vision.cards import Recognizer, glyph_color, ink_mask, normalize_glyph, similarity
 from tests.support import local_data_root
 
 DATA = local_data_root() / "validation"
+
+
+@pytest.mark.parametrize("room", [*FLOW_ROOMS, "当前"])
+def test_flow_room_configuration_roundtrip_preserves_defaults_and_format(tmp_path, room):
+    store = Store(tmp_path)
+    assert store.profile.flow_room == "初级"
+    store.profile.flow_room = room
+    store.save()
+    restored = Store(tmp_path)
+    assert restored.profile.flow_room == room
+    assert restored.profile.continuous_settings == {"max_games": 5, "time_limit": 1800}
+    assert restored.profile.bid_settings["mode"] == "disabled"
+    assert json.loads(store.settings_path.read_text(encoding="utf8"))["version"] == 4
+
+
+def test_flow_room_configuration_rejects_unsupported_room(tmp_path):
+    store = Store(tmp_path)
+    store.profile.flow_room = "专家"
+    with pytest.raises(ValueError, match="场次"):
+        store.save()
+    assert not store.settings_path.exists()
 
 
 def test_chinese_paths_and_export_are_bound_to_same_frame(tmp_path, frame):
