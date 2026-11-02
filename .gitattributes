@@ -6,3 +6,7 @@
 *.json text eol=lf
 *.yml text eol=lf
 *.png binary
+# 固定参考源码与许可证的换行，避免 Windows 检出改变来源校验所需的字节哈希。
+src/doudizhu_lab/_vendor/douzero_resnet/LICENSE text eol=lf
+# 原始参考文本保留上游空白，不能通过清理行尾空格改变来源哈希。
+tests/fixtures/resnet_*.py.txt text eol=lf whitespace=-blank-at-eol

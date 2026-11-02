@@ -10,6 +10,7 @@ import numpy as np
 
 from doudizhu_lab._vendor.douzero.env.env import DummyAgent
 from doudizhu_lab._vendor.douzero.env.game import GameEnv
+from doudizhu_lab.agents.backends import create_agent
 from doudizhu_lab.agents.douzero import DECK, ROLES, TO_RANK, Agent, context
 from doudizhu_lab.domain.bot_types import ActionButton, HandCard, ObservationSnapshot, SnapshotSequence
 from doudizhu_lab.domain.models import Frame, PixelRect
@@ -434,7 +435,7 @@ def evaluate_bot(
     store, *, mode: str, session: Path | None = None, games: int = 30, scope: Path | None = None
 ) -> dict:
     """命令行统一入口；只创建模型进程和模拟输入对象，不导入或调用设备输入方法。"""
-    agent = Agent(store.root / "models/douzero-wp")
+    agent = create_agent(store.root, store.profile.play_model)
     try:
         agent.start()
         if mode == "simulation":
@@ -445,7 +446,7 @@ def evaluate_bot(
             if session is None or scope is None:
                 raise ValueError("录像建议评测需要 --session 和 --scope")
             report = replay_advice(agent, session, scope)
-        report.update(model_id=agent.model_id, live_verified=False)
+        report.update(model_id=agent.model_id, play_model=agent.backend, live_verified=False)
         return report
     finally:
         agent.close()

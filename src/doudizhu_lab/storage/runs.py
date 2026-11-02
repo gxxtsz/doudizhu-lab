@@ -10,6 +10,8 @@ from threading import RLock
 from types import SimpleNamespace
 from uuid import uuid4
 
+from doudizhu_lab.domain.settings import CONFIGURATION_VERSION
+
 
 class RunStore:
     """线程安全的追加账本；当前状态可更新，操作、暂停与完成证据只追加。"""
@@ -47,7 +49,7 @@ class RunStore:
             if pipeline.profile.bid_settings["mode"] == "model"
             else "不叫、不抢、不加倍",
             "status": "running",
-            "configuration_version": 4,
+            "configuration_version": CONFIGURATION_VERSION,
         }.items():
             result.set(key, value)
         return result

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication
 from doudizhu_lab import __version__
 from doudizhu_lab.cli.console import configure_console
 from doudizhu_lab.domain.models import Device
+from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES
 from doudizhu_lab.domain.table import TableObservation
 from doudizhu_lab.runtime.bot import InputGate
 from doudizhu_lab.simulation.bot import SimulatedDevice
@@ -177,7 +178,7 @@ class DemoWindow(MainWindow):
     def primary_action(self) -> None:
         """单局演示的显式开始按钮；先记录模拟源，再明确授权单局自动执行。"""
         if not self.bot or not self.bot.ready.is_set():
-            self.message = "请等待 WP 模型就绪后开始模拟"
+            self.message = "请等待所选模型就绪后开始模拟"
             self.render_dashboard()
             return
         if not self.recording:
@@ -212,7 +213,7 @@ class DemoWindow(MainWindow):
 
 
 class NativeCheck(QObject):
-    """原生 GUI 自检：真实 WP 进程配合模拟输入，逐阶段检查取消及末手确认。"""
+    """原生 GUI 自检：所选真实模型配合模拟输入，逐阶段检查取消及末手确认。"""
 
     def __init__(self, window, application):
         super().__init__(window)
@@ -412,6 +413,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="本地机器人模拟窗口，不连接手机")
     parser.add_argument("--version", action="version", version=f"斗地主实验室 {__version__}")
     parser.add_argument("--data-dir", type=Path, help="演示数据与模型所在目录，不连接手机")
+    parser.add_argument(
+        "--play-model", choices=tuple(PLAY_MODEL_NAMES), help="本次模拟的出牌模型，不保存偏好"
+    )
     parser.add_argument("--check", action="store_true", help="自动检查原生窗口模式、停止与关闭并导出报告")
     parser.add_argument("--continuous", action="store_true", help="使用从大厅开始的多局模拟后端")
     parser.add_argument(
@@ -421,6 +425,8 @@ def main() -> None:
     app = QApplication([])
     app.setFont(QFont("Microsoft YaHei UI", 10))
     store = Store(args.data_dir)
+    if args.play_model:
+        store.profile.play_model = args.play_model
     if args.bidding:
         store.profile.bid_settings["mode"] = args.bidding
     window = (ContinuousDemoWindow if args.continuous else DemoWindow)(store)

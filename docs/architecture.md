@@ -25,6 +25,8 @@
 
 模型通过`ModelStatus`发布加载生命周期，连续任务通过`ContinuousProgress`发布只读进度，窗口汇总为`DashboardState`绘制面板，不解析拼接文案。流程持有设备锁时，界面读取缓存进度，不阻塞GUI心跳。
 
+`create_agent(root, backend="resnet")`按明确偏好创建代理，`Profile.play_model`保存选择；旧`Agent(folder)`仍默认为WP。ResNet编码及网络独立保存，界面进程不导入PyTorch。`ModelStatus`和`DashboardState`包含模型后端、显示名称和权重编号；`Decision.strategy`区分`resnet`、`wp`、`rules`，两种模型执行前均经过完整公开局面校验。切换由协调线程串行关闭旧代理、预热新代理，界面立即清除旧建议，迟到结果不得发布。
+
 停止先调用输入闸门的`suspend`锁住重新授权，并通过`request_stop`非阻塞登记意图；后台再关闭账本和录像。只有显式开始、恢复或隔离模拟控制调用`allow`解除停止锁。准备中取消仍必须回收迟到的录像资源。
 
 不要让领域层创建设备对象、让回放持有真实输入接口，或让工作线程持有QObject。动作取消不能等待模型或USB返回才能生效。

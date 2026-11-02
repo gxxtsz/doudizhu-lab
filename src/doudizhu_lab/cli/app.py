@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from doudizhu_lab import __version__
 from doudizhu_lab.cli.console import configure_console
-from doudizhu_lab.domain.settings import FLOW_ROOMS
+from doudizhu_lab.domain.settings import FLOW_ROOMS, PLAY_MODEL_NAMES
 from doudizhu_lab.storage.config import Store
 from doudizhu_lab.ui.window import MainWindow
 
@@ -19,7 +19,7 @@ def main() -> None:
     """在 GUI 主线程解析命令行并启动窗口；正常关闭后返回 None。
 
     --data-dir 用于隔离测试数据，--preview 显式只读预览；默认也会预览唯一授权手机。
-    窗口显示后自动后台加载本地 WP 模型，不隐式下载；--flow-room 接受明确的
+    窗口显示后自动后台加载所选本地模型，不隐式下载；--flow-room 接受明确的
     洗牌场次或“当前”，后者沿用初、中、高级场。该偏好本身不启动匹配或授予输入。
     只有用户显式启动连续游戏后，窗口才准备录像并申请输入；参数错误由
     argparse 以 SystemExit 拒绝，配置加载错误通过中文对话框说明后退出。
@@ -27,6 +27,9 @@ def main() -> None:
     configure_console()
     parser = argparse.ArgumentParser(description="斗地主实验室")
     parser.add_argument("--data-dir", type=Path, help="本地运行数据目录")
+    parser.add_argument(
+        "--play-model", choices=tuple(PLAY_MODEL_NAMES), help="本次启动的出牌模型，不保存偏好"
+    )
     classifier = parser.add_mutually_exclusive_group()
     classifier.add_argument(
         "--hand-ocr", action="store_true", help="试用免训练手牌OCR；需要 vision 依赖与模型"
@@ -70,6 +73,8 @@ def main() -> None:
     app.setFont(QFont("Microsoft YaHei UI", 10))
     try:
         store = Store(args.data_dir)
+        if args.play_model:
+            store.profile.play_model = args.play_model
         if args.hand_ocr or args.hand_template:
             store.profile.hand_classifier = "pretrained-ocr" if args.hand_ocr else "template"
         if args.flow_room:

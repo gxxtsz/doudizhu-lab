@@ -28,7 +28,7 @@ def test_flow_room_configuration_roundtrip_preserves_defaults_and_format(tmp_pat
     assert restored.profile.flow_room == room
     assert restored.profile.continuous_settings == {"max_games": 5, "time_limit": 1800}
     assert restored.profile.bid_settings["mode"] == "disabled"
-    assert json.loads(store.settings_path.read_text(encoding="utf8"))["version"] == 4
+    assert json.loads(store.settings_path.read_text(encoding="utf8"))["version"] == 5
 
 
 def test_flow_room_configuration_rejects_unsupported_room(tmp_path):

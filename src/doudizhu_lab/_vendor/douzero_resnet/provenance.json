@@ -1,0 +1,25 @@
+{
+  "revision": "eaf0436676c199507fe5420e464daa951a83d704",
+  "repository": "https://github.com/godmoves/perfectdou",
+  "adaptation": "仅提取 BasicBlock、ResnetModel；公开编码独立适配，删除未参与输出的 all_handcards 读取及无用计算；历史倒序、-1填充、真实不出零编码、剩余底牌和15维固定兼容常量保持上游数值；网络评分不乘评测脚本的8倍展示系数。原始编码及网络作为测试参考保存，接口补充中文注释。",
+  "files": [
+    {
+      "file": "models.py",
+      "url": "https://raw.githubusercontent.com/godmoves/perfectdou/eaf0436676c199507fe5420e464daa951a83d704/perfectdou/model/douzero/models.py",
+      "sha256": "b6bc0acefadcac76d06f1dacf646623540a9a8a6cec7d2973ea93bb5aa2b71e6",
+      "upstream_sha256": "aa7ffbd226898be781dbfe2c99bf425080e710e5f7fea6c1368fdaffea257ce8"
+    },
+    {
+      "file": "../../agents/resnet_features.py",
+      "url": "https://raw.githubusercontent.com/godmoves/perfectdou/eaf0436676c199507fe5420e464daa951a83d704/perfectdou/env/env.py",
+      "sha256": "bd3d5c5bc8b1fdd425ca6d0e4d8a723fb86d17d72e977ad75d8f4c7e9d62c2d3",
+      "upstream_sha256": "6729b4c59979a50d6c281b8f236cc353c27d21eab381ecc86d9203f312b09ccd"
+    },
+    {
+      "file": "LICENSE",
+      "url": "https://raw.githubusercontent.com/godmoves/perfectdou/eaf0436676c199507fe5420e464daa951a83d704/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "upstream_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  ]
+}

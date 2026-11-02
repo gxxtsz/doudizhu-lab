@@ -241,9 +241,8 @@ def test_unknown_submission_and_capture_gap_cannot_activate_fallback():
     assert observer.rule is None and result.state["capture_incomplete"]
 
 
-@pytest.fixture
-def balanced_run(tmp_path):
-    from time import monotonic
+@pytest.fixture(params=[4000.0, 9000.0])
+def balanced_run(tmp_path, request):
     from types import SimpleNamespace
 
     from doudizhu_lab.agents.douzero import TO_RANK
@@ -273,7 +272,8 @@ def balanced_run(tmp_path):
                 0,
             )
 
-    now = [monotonic()]
+    # 两种量级下 0.12 的浮点累加方向相反；模拟调度都必须保留足够的确认帧。
+    now = [request.param]
     store = Store(tmp_path)
     store.profile.continuous_policy = "balanced"
     store.profile.continuous_settings["max_games"] = 1

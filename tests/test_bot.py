@@ -117,7 +117,8 @@ def test_snapshot_immutable_and_semantic_version_stable(device):
 
 def test_context_excludes_individual_opponent_hands_and_counts_bottom_once(device):
     data = context(device.last)
-    assert "all_handcards" not in data and "three_landlord_cards" not in data
+    assert "all_handcards" not in data
+    assert Counter(data["three_landlord_cards"]) == Counter(device.bottom)
     assert len(data["player_hand_cards"]) == 20 and len(data["other_hand_cards"]) == 34
     assert Counter(data["player_hand_cards"] + data["other_hand_cards"]) == DECK
     assert set(data) == {
@@ -131,6 +132,7 @@ def test_context_excludes_individual_opponent_hands_and_counts_bottom_once(devic
         "card_play_action_seq",
         "bomb_num",
         "legal_actions",
+        "three_landlord_cards",
     }
 
 

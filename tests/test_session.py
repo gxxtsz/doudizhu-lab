@@ -59,7 +59,7 @@ def test_legacy_profile_backup_and_region_preservation(tmp_path):
     assert "self_play" in store.profile.regions
     store.save()
     assert (tmp_path / "settings.v1.bak.json").read_text() == raw
-    assert json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))["version"] == 4
+    assert json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))["version"] == 5
 
 
 def test_boundary_revision_reassigns_events_without_rewriting_raw(tmp_path):

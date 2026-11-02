@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QMainWindow
 
 from doudizhu_lab.devices.adb import AdbClient
 from doudizhu_lab.domain.models import RANK_LABELS, Device, Frame
-from doudizhu_lab.domain.settings import Profile, validate_bot_profile
+from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES, Profile, validate_bot_profile
 from doudizhu_lab.domain.table import PHASE_NAMES, SEAT_NAMES
 from doudizhu_lab.runtime.bot import BotRuntime, InputGate, ModelStatus
 from doudizhu_lab.runtime.continuous import ContinuousProgress, ContinuousRuntime
@@ -220,11 +220,11 @@ class MainWindow(QMainWindow):
         self.pause_preview() if self.running else self.start_preview()
 
     def load_bot(self) -> None:
-        """GUI 线程申请后台加载本地 WP；可重试失败，不重复创建线程，也不联网或授予输入。"""
+        """GUI 线程申请后台加载所选本地模型；可重试失败，不联网或授予输入。"""
         if self._exit_requested or self._closing:
             return
         if self.bot is None:
-            self.bot = BotRuntime(self.store.root, self.input_gate)
+            self.bot = BotRuntime(self.store.root, self.input_gate, play_model=self.store.profile.play_model)
         self.bot.start()
         self.render_dashboard()
 
@@ -259,7 +259,7 @@ class MainWindow(QMainWindow):
             return
         model = self.bot.model_status() if self.bot else ModelStatus("unloaded")
         if action == "continuous" and model.state != "ready":
-            self.message = "请等待 WP 模型加载就绪；加载失败时可重试"
+            self.message = "请等待所选模型加载就绪；加载失败时可重试"
             self.render_dashboard()
             return
         if not self.selected_device or self.selected_device.state != "device":
@@ -531,9 +531,9 @@ class MainWindow(QMainWindow):
             if model != self._observed_model:
                 self._observed_model = model
                 if model.state == "failed":
-                    self.log("WP 模型加载失败：" + model.error)
+                    self.log(model.display_name + " 模型加载失败：" + model.error)
                 elif model.state == "ready":
-                    self.log("WP 模型已就绪")
+                    self.log(model.display_name + " 模型已就绪")
             self.bot.attach(self.recording if hasattr(self.recording, "bot_snapshot") else None)
         if self.recording and not self._record_stopping:
             try:
@@ -579,7 +579,15 @@ class MainWindow(QMainWindow):
 
     def dashboard_state(self) -> DashboardState:
         """在 GUI 线程复制展示数据，不解析状态文案；未知角色、行动与牌数不作推测。"""
-        model = self.bot.model_status() if self.bot else ModelStatus("unloaded")
+        model = (
+            self.bot.model_status()
+            if self.bot
+            else ModelStatus(
+                "unloaded",
+                backend=self.store.profile.play_model,
+                display_name=PLAY_MODEL_NAMES[self.store.profile.play_model],
+            )
+        )
         device = self.selected_device
         authorized = [d for d in self.available_devices if d.state == "device"]
         unauthorized = any(d.state == "unauthorized" for d in self.available_devices)
@@ -637,7 +645,12 @@ class MainWindow(QMainWindow):
                 and suggestion.turn == state.get("turn")
             ):
                 cards = " ".join(RANK_LABELS.get(c, c) for c in suggestion.cards) or "不出"
-                action = f"{'规则策略' if suggestion.strategy == 'rules' else 'WP 建议'}：{cards}"
+                name = (
+                    "规则策略"
+                    if suggestion.strategy == "rules"
+                    else PLAY_MODEL_NAMES[suggestion.strategy] + " 建议"
+                )
+                action = f"{name}：{cards}"
             else:
                 action = "等待确认当前行动" if actor == "自己" else "等待对手行动"
         elif state.get("phase") == "settlement" or state.get("ended"):
@@ -645,10 +658,14 @@ class MainWindow(QMainWindow):
         elif state.get("phase") in ("dealing", "bidding", "doubling"):
             action = PHASE_NAMES[state["phase"]]
         if model.state == "failed":
-            notice = "WP 模型不可用：" + model.error
+            notice = model.display_name + " 模型不可用：" + model.error
         if not notice:
             if model.state != "ready":
-                notice = "正在后台加载本地 WP 模型…" if model.state == "loading" else "等待 WP 模型加载"
+                notice = (
+                    f"正在后台加载本地 {model.display_name} 模型…"
+                    if model.state == "loading"
+                    else f"等待 {model.display_name} 模型加载"
+                )
             elif not device:
                 notice = (
                     "发现多台已授权设备，请在设置中选择一台"
@@ -669,6 +686,9 @@ class MainWindow(QMainWindow):
             status=status,
             model_state=model.state,
             model_error=model.error,
+            model_backend=model.backend,
+            model_name=model.display_name,
+            model_id=model.model_id,
             device_text=device_text,
             device_ready=bool(device and device.state == "device"),
             scene=scene,
@@ -692,10 +712,10 @@ class MainWindow(QMainWindow):
         self._tone(self.connection_label, "success" if state.device_ready else "")
         self.model_label.setText(
             {
-                "unloaded": "WP · 未加载",
-                "loading": "WP · 加载中",
-                "ready": "WP · 已就绪",
-                "failed": "WP · 加载失败",
+                "unloaded": state.model_name + " · 未加载",
+                "loading": state.model_name + " · 加载中",
+                "ready": state.model_name + " · 已就绪",
+                "failed": state.model_name + " · 加载失败",
             }[state.model_state]
         )
         self._tone(
@@ -717,6 +737,7 @@ class MainWindow(QMainWindow):
         self.notice_label.setToolTip(state.notice)
         self._tone(self.notice_label, "error" if state.model_state == "failed" else tone)
         self.retry_button.setVisible(state.model_state == "failed")
+        self.retry_button.setText("重试加载 " + state.model_name)
         self.retry_button.setEnabled(
             not self.settings_locked and not (self.bot and self.bot.thread and self.bot.thread.is_alive())
         )
@@ -773,6 +794,13 @@ class MainWindow(QMainWindow):
         self.select_device(serial)
         if old_adb != adb_path:
             self.refresh_devices()
+        if old_profile.play_model != profile.play_model:
+            if self.bot:
+                self.bot.switch_model(profile.play_model)
+            else:
+                self.load_bot()
+            self._observed_model = None
+            self.message = f"正在切换到 {PLAY_MODEL_NAMES[profile.play_model]} 模型…"
         self.log("设置已保存，将用于下一次任务")
 
     def open_settings(self) -> None:

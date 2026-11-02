@@ -8,6 +8,8 @@ from doudizhu_lab.domain.models import NormalizedRect, TrackerSettings
 
 # 连续流程只授权这些洗牌场次；配置、命令行和视觉扫描共用，避免“当前”漏掉高级场。
 FLOW_ROOMS: tuple[str, ...] = ("初级", "中级", "高级")
+PLAY_MODEL_NAMES = {"resnet": "ResNet", "wp": "WP"}
+CONFIGURATION_VERSION = 5
 
 
 def default_bid_settings() -> dict[str, str | float]:
@@ -45,6 +47,8 @@ class Profile:
     margin: float = 0.055
     # 默认为历史模板算法；显式选择时手牌改用固定预训练OCR，其余区域保持模板。
     hand_classifier: str = "template"
+    # 只保存出牌模型偏好；旧配置缺少此字段时升级为 ResNet，不恢复任何执行授权。
+    play_model: str = "resnet"
     # 仅保存策略和上限；运行授权、当前模式与未完成任务不得跨重启恢复。
     continuous_settings: dict = field(default_factory=lambda: {"max_games": 5, "time_limit": 1800})
     # 只进入用户明确选择的场次；不因游戏弹窗自动升级。
@@ -107,6 +111,8 @@ def validate_bot_profile(profile: Profile) -> None:
     """
     if profile.hand_classifier not in ("template", "pretrained-ocr"):
         raise ValueError("手牌分类器配置无效")
+    if not isinstance(profile.play_model, str) or profile.play_model not in PLAY_MODEL_NAMES:
+        raise ValueError("出牌模型必须为 resnet 或 wp")
     settings = profile.continuous_settings
     bidding = profile.bid_settings
     if set(bidding) != set(default_bid_settings()) or bidding["mode"] not in ("disabled", "model"):

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from doudizhu_lab._vendor.douzero.env.game import GameEnv
 from doudizhu_lab.domain.bot_types import Decision, ObservationSnapshot
 from doudizhu_lab.domain.models import RANKS
+from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES
 
 SOURCE_COMMIT = "c01062592f362cfb77d6af14a34c2cbcfa614fd2"
 ROLES = ("landlord", "landlord_down", "landlord_up")
@@ -148,11 +149,21 @@ def context(snapshot: ObservationSnapshot) -> dict:
         "card_play_action_seq": sequence,
         "bomb_num": bombs,
         "legal_actions": actions,
+        # 对齐上游“底牌剩余情况”：地主打出的同点牌按多重集合扣除，不读取隐藏手牌。
+        "three_landlord_cards": sorted(
+            (Counter(TO_NUMBER[c] for c in state["bottom"]) - Counter(played["landlord"])).elements()
+        ),
     }
 
 
-def verify_models(folder: Path) -> dict:
+def verify_models(folder: Path, backend: str = "wp") -> dict:
     """每次启动核对完整权重与固定来源清单；不接受随机初始化或悄悄缺少参数。"""
+    if backend == "resnet":
+        from doudizhu_lab.agents.backends import verify_resnet_models
+
+        return verify_resnet_models(folder)
+    if backend != "wp":
+        raise ValueError("未知出牌模型")
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     if manifest["source_commit"] != SOURCE_COMMIT or set(manifest["weights"]) != set(ROLES):
         raise ValueError("模型来源清单不匹配")
@@ -223,7 +234,12 @@ class Agent:
     丢弃迟到结果；再次启动必须由上层明确恢复。不同调用由锁串行，禁止推理积压。
     """
 
-    def __init__(self, folder: Path):
+    def __init__(self, folder: Path, *, backend: str = "wp"):
+        """绑定明确模型类型；旧 Agent(folder) 继续使用 WP，构造时不加载或下载权重。"""
+        if backend not in PLAY_MODEL_NAMES:
+            raise ValueError("未知出牌模型")
+        self.backend = backend
+        self.display_name = PLAY_MODEL_NAMES[backend]
         self.folder = folder.resolve()
         self.process = None
         self.responses = Queue()
@@ -255,7 +271,18 @@ class Agent:
         with self.lock:
             if self.process is not None and self.process.poll() is None:
                 return
-            manifest = verify_models(self.folder)
+            try:
+                manifest = (
+                    verify_models(self.folder)
+                    if self.backend == "wp"
+                    else verify_models(self.folder, self.backend)
+                )
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                error_type = OSError if isinstance(exc, OSError) else ValueError
+                raise error_type(
+                    f"{self.display_name} 模型未准备或校验失败：{exc}；"
+                    f"请执行 ddz-check setup-agent --model {self.backend}，或在设置中选择已准备的模型"
+                ) from exc
             self.model_id = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
             self.responses = Queue()
             error = (self.folder / "推理错误.log").open("a", encoding="utf-8")
@@ -269,6 +296,7 @@ class Agent:
                         "-m",
                         "doudizhu_lab.agents.worker",
                         str(self.folder),
+                        self.backend,
                     ],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -291,6 +319,9 @@ class Agent:
         except Empty:
             self.close()
             raise ValueError("模型推理超时，已停止进程") from None
+        if not isinstance(result, dict):
+            self.close()
+            raise ValueError("模型返回的协议数据必须为 JSON 对象")
         if "error" in result:
             self.close()
             raise ValueError(result["error"])
@@ -307,8 +338,15 @@ class Agent:
             self.process.stdin.flush()
             output = self._receive(2)
             cards = output["cards"]
-            if cards not in value["legal_actions"]:
+            if (
+                not isinstance(cards, list)
+                or any(type(card) is not int for card in cards)
+                or cards not in value["legal_actions"]
+            ):
                 raise ValueError("模型返回了非法动作")
+            score = output["value"]
+            if type(score) not in (int, float) or not float("-inf") < score < float("inf"):
+                raise ValueError("模型返回了无效评分")
             state = snapshot.state
             return Decision(
                 tuple(TO_RANK[n] for n in cards),
@@ -318,8 +356,9 @@ class Agent:
                 value["player_position"],
                 self.model_id,
                 (perf_counter() - start) * 1000,
-                output["value"],
+                score,
                 snapshot.revision,
+                strategy=self.backend,
             )
 
     def close(self):

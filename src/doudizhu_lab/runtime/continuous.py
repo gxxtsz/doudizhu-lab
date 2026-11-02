@@ -678,17 +678,17 @@ class ContinuousRuntime:
         }
         if rule_game and self.pipeline.profile.continuous_policy == "balanced":
             # 局部规则不宣称补齐原前史；完成依据改为明确结算、本人手牌监控及全部提交确认。
-            wp_turns = {
+            model_turns = {
                 d["turn"]
                 for ident, d in starts.items()
-                if ident in confirmed_ids and d.get("strategy", "wp") == "wp"
+                if ident in confirmed_ids and d.get("strategy", "wp") in ("wp", "resnet")
             }
             verified = bool(
                 not state.get("rule_halt_reason")
                 and not state["capture_incomplete"]
                 and starts
                 and set(starts) == confirmed_ids
-                and wp_turns == expected
+                and model_turns == expected
             )
         if not verified:
             if self.clock() - self._finish_wait > 3:

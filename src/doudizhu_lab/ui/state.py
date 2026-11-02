@@ -33,3 +33,6 @@ class DashboardState:
     remaining: tuple[str, str, str] = ("—", "—", "—")
     action: str = "等待新的牌局"
     saved: bool = False
+    model_backend: str = "resnet"
+    model_name: str = "ResNet"
+    model_id: str = ""

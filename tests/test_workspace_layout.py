@@ -33,7 +33,7 @@ for width, height in ((1440, 900), (1100, 720)):
     w.resize(width, height)
     for status in ("idle", "preparing", "running", "paused", "failed", "stopping"):
         w.task_status = status
-        w.bot._model_status = ModelStatus("failed", "模型校验失败" * 50) if status == "failed" else ModelStatus("ready")
+        w.bot._model_status = w.bot._model_state("failed", "模型校验失败" * 50) if status == "failed" else w.bot._model_state("ready")
         w.message = "暂停原因：等待清晰画面后恢复。" if status == "paused" else ""
         w.render_dashboard()
         app.processEvents()

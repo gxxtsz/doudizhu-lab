@@ -94,7 +94,11 @@ class ObservationSnapshot:
 
 @dataclass(frozen=True)
 class Decision:
-    """模型建议而非事实；绑定局面版本和行动轮次，旧建议不得执行。"""
+    """模型建议而非事实；绑定局面版本和行动轮次，旧建议不得执行。
+
+    strategy 明确区分 resnet、wp 和 rules；默认 wp 保留旧账本及调用方兼容。
+    value 保存对应后端的原始评分，既非校准胜率，也不能在不同后端之间直接比较。
+    """
 
     cards: tuple[str, ...]
     version: str

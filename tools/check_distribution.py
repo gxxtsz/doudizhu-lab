@@ -23,6 +23,16 @@ def check_archive(path: Path) -> None:
         with tarfile.open(path, "r:gz") as archive:
             names = [m.name for m in archive.getmembers() if m.isfile()]
         names = [n.split("/", 1)[-1] for n in names]
+    package_prefix = "doudizhu_lab/" if path.suffix == ".whl" else "src/doudizhu_lab/"
+    for required in (
+        "_vendor/douzero_resnet/LICENSE",
+        "_vendor/douzero_resnet/provenance.json",
+        "_vendor/douzero_resnet/models.py",
+        "agents/resnet_features.py",
+        "agents/backends.py",
+    ):
+        if package_prefix + required not in names:
+            raise ValueError(f"发行包缺少 ResNet 源码或来源声明：{required}")
     forbidden = {"data", ".venv", "__pycache__", ".idea", ".git", ".pytest_cache", ".ruff_cache"}
     suffixes = {".mkv", ".mp4", ".onnx", ".ckpt", ".pkl", ".pt", ".sqlite3", ".pyc", ".log"}
     for name in names:

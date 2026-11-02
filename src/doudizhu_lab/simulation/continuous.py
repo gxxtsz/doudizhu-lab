@@ -1,4 +1,4 @@
-"""完整流程模拟源：真实规则及WP推理，共用生产协调器，不构造ADB客户端。"""
+"""完整流程模拟源：真实规则及所选模型推理，共用生产协调器，不构造ADB客户端。"""
 
 import json
 from collections import Counter
@@ -12,7 +12,8 @@ from uuid import uuid4
 
 import numpy as np
 
-from doudizhu_lab.agents.douzero import ROLES, Agent
+from doudizhu_lab.agents.backends import create_agent
+from doudizhu_lab.agents.douzero import ROLES
 from doudizhu_lab.domain.models import Frame, PixelRect
 from doudizhu_lab.domain.table import TableObservation
 from doudizhu_lab.runtime.bot import BotRuntime, InputGate
@@ -139,7 +140,8 @@ class ContinuousSimPipeline:
                 self.phase == "playing"
                 and not self.device.env.game_over
                 and self.device.env.acting_player_position != self.device.roles["self"]
-                and self.clock() - self.last_action_at >= 0.36
+                # 至少保留四帧供推断及确认；按整数微秒比较，避免时钟量级改变浮点舍入。
+                and round((self.clock() - self.last_action_at) * 1_000_000) >= 480_000
             ):
                 legal = self.device.env.game_infoset.legal_actions
                 if self.fault == "hidden_play" and any(legal):
@@ -346,7 +348,7 @@ class ContinuousSimPipeline:
 
 def simulate_continuous(store, *, runs=6, output=None):
     """用真实模型执行6个五局连续任务；模型输入保持生产公开信息接口，所有来源标为模拟。"""
-    agent = Agent(store.root / "models/douzero-wp")
+    agent = create_agent(store.root, store.profile.play_model)
     agent.start()
     reports = []
     try:
@@ -414,7 +416,8 @@ def simulate_continuous(store, *, runs=6, output=None):
         "identity_note": "模型叫抢时身份由实际叫抢决定，不强制每种身份10局"
         if model_bidding
         else "固定三种身份各至少10局",
-        "note": "生产连续协调器、单局协调器和执行器，共用真实WP权重；未验证真实像素和手机输入。",
+        "play_model": store.profile.play_model,
+        "note": "生产连续协调器、单局协调器和执行器，共用所选真实模型权重；未验证真实像素和手机输入。",
     }
     target = Path(output) if output else store.root / "continuous-evaluation/模拟连续任务.json"
     target.parent.mkdir(parents=True, exist_ok=True)

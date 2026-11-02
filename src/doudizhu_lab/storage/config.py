@@ -14,8 +14,8 @@ import numpy as np
 
 from doudizhu_lab.devices.adb import discover_adb
 from doudizhu_lab.domain.models import RANKS, Frame, NormalizedRect, Recognition, TrackerSettings
+from doudizhu_lab.domain.settings import CONFIGURATION_VERSION, default_bid_settings, default_regions
 from doudizhu_lab.domain.settings import Profile as Profile
-from doudizhu_lab.domain.settings import default_bid_settings, default_regions
 from doudizhu_lab.domain.settings import validate_bot_profile as validate_bot_profile
 from doudizhu_lab.paths import resolve_data_dir
 
@@ -51,7 +51,7 @@ class Store:
         self.settings_path = self.root / "settings.json"
         self.profile = Profile()
         self.adb_path = discover_adb()
-        self.settings_version = 4
+        self.settings_version = CONFIGURATION_VERSION
         self._bidding_upgrade = False
         if self.settings_path.exists():
             try:
@@ -75,6 +75,7 @@ class Store:
                     threshold=float(p.get("threshold", 0.84)),
                     margin=float(p.get("margin", 0.055)),
                     hand_classifier=p.get("hand_classifier", "template"),
+                    play_model=p.get("play_model", "resnet"),
                     continuous_settings=p.get("continuous_settings", self.profile.continuous_settings),
                     flow_room=p.get("flow_room", "初级"),
                     continuous_policy=p.get("continuous_policy", "strict"),
@@ -117,20 +118,24 @@ class Store:
                 shutil.copy2(self.settings_path, backup)
             self._bidding_upgrade = False
         target = self.settings_path.with_suffix(".tmp")
-        if self.settings_path.exists() and self.settings_version < 4:
+        if self.settings_path.exists() and self.settings_version < CONFIGURATION_VERSION:
             backup = self.settings_path.with_name(f"settings.v{self.settings_version}.bak.json")
             if not backup.exists():
                 shutil.copy2(self.settings_path, backup)
         target.write_text(
             json.dumps(
-                {"version": 4, "adb_path": self.adb_path, "profile": asdict(self.profile)},
+                {
+                    "version": CONFIGURATION_VERSION,
+                    "adb_path": self.adb_path,
+                    "profile": asdict(self.profile),
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
             encoding="utf-8",
         )
         target.replace(self.settings_path)
-        self.settings_version = 4
+        self.settings_version = CONFIGURATION_VERSION
 
     def add_template(self, rgb: np.ndarray, rank: str, group: str, source: str | dict) -> Path:
         """保存人工确认的牌点裁剪和标签；group 分为 hand、bottom、table。

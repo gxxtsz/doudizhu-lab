@@ -49,7 +49,7 @@ class FastAgent:
 
 @pytest.mark.gui
 def test_native_simulator_step_stop_record_close(qtbot, tmp_path, monkeypatch):
-    monkeypatch.setattr("doudizhu_lab.runtime.bot.Agent", FastAgent)
+    monkeypatch.setattr("doudizhu_lab.runtime.bot.create_agent", FastAgent)
     window = DemoWindow(Store(tmp_path))
     qtbot.addWidget(window)
     window.show()
@@ -116,7 +116,7 @@ def test_gui_collection_thread_and_model_load_shutdown(qtbot, tmp_path, monkeypa
         def start(self):
             sleep(0.15)
 
-    monkeypatch.setattr("doudizhu_lab.runtime.bot.Agent", LoadingAgent)
+    monkeypatch.setattr("doudizhu_lab.runtime.bot.create_agent", lambda *args: LoadingAgent())
     runtime = BotRuntime(tmp_path, __import__("doudizhu_lab.runtime.bot", fromlist=["InputGate"]).InputGate())
     runtime.start()
     runtime.close()

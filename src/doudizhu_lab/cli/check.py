@@ -37,7 +37,10 @@ def main() -> None:
     scoring.add_argument("manifest", type=Path, help="标注清单 JSON")
     scoring.add_argument("--output", type=Path, help="结果 JSON 的保存位置")
     sub.add_parser("setup-video", help="下载并校验固定版本 scrcpy-server 5.0.1")
-    sub.add_parser("setup-agent", help="下载固定 WP 权重并预热验证三种身份；不连接手机")
+    setup_model = sub.add_parser("setup-agent", help="下载固定出牌权重并预热验证三种身份；不连接手机")
+    setup_model.add_argument(
+        "--model", choices=("resnet", "wp"), default="resnet", help="默认准备 ResNet，可单独准备 WP"
+    )
     sub.add_parser("setup-bidding", help="下载并核验固定叫抢模型，CPU预热；不训练、不连接手机")
     sub.add_parser("setup-vision", help="下载并校验OCR模型；不训练、不连接手机")
     run = sub.add_parser("evaluate-run", help="只读评测连续任务，模拟与真机来源分别标注")
@@ -51,6 +54,7 @@ def main() -> None:
     simulation.add_argument("--runs", type=int, default=6, help="五局任务数，正式离线检查至少6次")
     simulation.add_argument("--output", type=Path)
     simulation.add_argument("--require-pass", action="store_true")
+    simulation.add_argument("--play-model", choices=("resnet", "wp"), help="本次模拟使用的出牌模型")
     simulation.add_argument(
         "--bidding", choices=("disabled", "model"), help="模拟中启用真实叫抢评分，实际叫抢结果决定身份"
     )
@@ -83,6 +87,7 @@ def main() -> None:
     bot_eval.add_argument("--games", type=int, default=30, help="模拟局数，正式离线检查至少30局")
     bot_eval.add_argument("--output", type=Path, help="评测报告 JSON")
     bot_eval.add_argument("--require-pass", action="store_true", help="未达离线完成条件返回非零退出码")
+    bot_eval.add_argument("--play-model", choices=("resnet", "wp"), help="本次建议或模拟使用的出牌模型")
     sub.add_parser("freeze-acceptance", help="冻结程序、配置和模板，为新批次实时验收建立基准")
     reject = sub.add_parser("reject-acceptance", help="将已失败的正式验收批次登记为开发回归资料")
     reject.add_argument("folder", type=Path, help="已停止的正式验收会话目录")
@@ -116,6 +121,8 @@ def main() -> None:
         parser.error("回放评测必须提供 --scope 范围清单")
     try:
         store = Store(args.data_dir)
+        if getattr(args, "play_model", None):
+            store.profile.play_model = args.play_model
         recognizer = Recognizer(store.template_dir)
         if args.command == "devices":
             print(
@@ -185,9 +192,9 @@ def main() -> None:
             export_prediction(store, args.image, backend=args.backend, output=args.output)
             print(f"离线检测结果已保存：{args.output}")
         elif args.command == "setup-agent":
-            from doudizhu_lab.agents.douzero import setup_agent
+            from doudizhu_lab.agents.backends import setup_play_model
 
-            print(json.dumps(setup_agent(store.root), ensure_ascii=False, indent=2))
+            print(json.dumps(setup_play_model(store.root, args.model), ensure_ascii=False, indent=2))
         elif args.command == "setup-bidding":
             from doudizhu_lab.agents.bidding import setup_bidding
 

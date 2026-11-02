@@ -19,7 +19,7 @@ def execution_context(snapshot, strategy="wp"):
         from doudizhu_lab.agents.rules import context as rule_context
 
         return rule_context(snapshot)
-    if strategy != "wp":
+    if strategy not in ("wp", "resnet"):
         raise ValueError("未知出牌策略")
     return context(snapshot)
 

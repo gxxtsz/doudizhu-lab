@@ -289,7 +289,7 @@ def test_settings_roundtrip_preserves_calibration_and_seconds(window, qtbot):
     dialog.time_limit.setTime(QTime(0, 12, 34))
     dialog.save()
     saved = Store(window.store.root)
-    assert saved.settings_version == 4 and saved.profile.bot_controls == before
+    assert saved.settings_version == 5 and saved.profile.bot_controls == before
     assert saved.profile.flow_room == "高级" and saved.profile.continuous_settings == {
         "max_games": 7,
         "time_limit": 754,
@@ -456,7 +456,7 @@ def test_background_model_load_failure_retry_and_deduplication(qtbot, tmp_path, 
             if len(calls) == 1:
                 raise ValueError("本地权重缺失")
 
-    monkeypatch.setattr("doudizhu_lab.runtime.bot.Agent", LoadingAgent)
+    monkeypatch.setattr("doudizhu_lab.runtime.bot.create_agent", lambda *args: LoadingAgent())
     window = MainWindow(Store(tmp_path), auto_refresh=False, auto_preview=False)
     qtbot.addWidget(window)
     window.show()
@@ -491,7 +491,7 @@ def test_close_while_model_loading_never_restarts(qtbot, tmp_path, monkeypatch):
             starts.append(1)
             sleep(0.1)
 
-    monkeypatch.setattr("doudizhu_lab.runtime.bot.Agent", SlowAgent)
+    monkeypatch.setattr("doudizhu_lab.runtime.bot.create_agent", lambda *args: SlowAgent())
     window = MainWindow(Store(tmp_path), auto_refresh=False, auto_preview=False)
     qtbot.addWidget(window)
     window.show()

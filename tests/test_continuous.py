@@ -416,14 +416,14 @@ def test_model_failure_or_heartbeat_loss_never_rearms_automatically(run):
     assert not run.pipeline.flow_commands
 
 
-def test_version_four_preserves_version_three_and_never_persists_authorization(tmp_path):
+def test_current_version_preserves_version_three_and_never_persists_authorization(tmp_path):
     original = json.dumps({"version": 3, "profile": asdict(Profile())}, ensure_ascii=False)
     (tmp_path / "settings.json").write_text(original, encoding="utf8")
     store = Store(tmp_path)
     store.save()
     assert (tmp_path / "settings.v3.bak.json").read_text(encoding="utf8") == original
     data = json.loads(store.settings_path.read_text(encoding="utf8"))
-    assert data["version"] == 4 and data["profile"]["continuous_settings"] == {
+    assert data["version"] == 5 and data["profile"]["continuous_settings"] == {
         "max_games": 5,
         "time_limit": 1800,
     }
@@ -728,11 +728,14 @@ def test_winner_animation_scene_requires_same_frame_explicit_end_evidence(monkey
 def test_gui_continuous_pause_resume_stop_and_shutdown(qtbot, tmp_path, monkeypatch):
     from doudizhu_lab.ui.demo import ContinuousDemoWindow
 
-    monkeypatch.setattr("doudizhu_lab.runtime.bot.Agent", lambda *a: LegalTestAgent())
+    monkeypatch.setattr("doudizhu_lab.runtime.bot.create_agent", lambda *a: LegalTestAgent())
     window = ContinuousDemoWindow(Store(tmp_path))
     qtbot.addWidget(window)
     window.show()
-    qtbot.waitUntil(lambda: window.bot is not None and window.bot.ready.is_set(), timeout=5000)
+    qtbot.waitUntil(
+        lambda: window.bot is not None and window.bot.ready.is_set() and window.action_button.isEnabled(),
+        timeout=5000,
+    )
     window.action_button.click()
     qtbot.waitUntil(lambda: window.continuous is not None and window.continuous.active, timeout=5000)
     runtime, pipeline = window.continuous, window.recording

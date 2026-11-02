@@ -3,6 +3,7 @@ Copyright 2026 Doudizhu Lab contributors
 
 本项目使用或适配第三方代码；各部分适用各自许可证，不代表上游对本项目的背书。
 DouZero：kwai/DouZero，Apache-2.0，固定提交及修改说明见第三方来源文档。
+DouZero ResNet网络与参考编码：godmoves/perfectdou，Apache-2.0；固定社区评测副本，来源及适配记录单独保存。
 叫抢模型结构：Vincentzyx/DouZero_For_HLDDZ_FullAuto，Apache-2.0。
 PaddleOCR、RapidOCR：Apache-2.0；这里只保留许可证和下载清单，不分发模型。
 scrcpy：Genymobile/scrcpy，Apache-2.0；服务器由用户显式下载，不打入本项目发行包。
