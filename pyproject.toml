@@ -1,11 +1,11 @@
 [project]
 name = "doudizhu-lab"
 dynamic = ["version"]
-description = "安卓真机斗地主画面、点击与牌面识别调试工具"
+description = "王者荣耀自动斗地主机器人，通过USB连接安卓手机，结合画面识别与本地模型完成自动对局"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{name = "Doudizhu Lab contributors"}]
-keywords = ["doudizhu", "douzero", "android", "adb", "computer-vision"]
+keywords = ["王者荣耀", "斗地主", "自动斗地主", "doudizhu", "douzero", "android", "adb", "computer-vision"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Operating System :: Microsoft :: Windows",

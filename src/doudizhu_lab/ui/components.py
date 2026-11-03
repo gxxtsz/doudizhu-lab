@@ -49,8 +49,13 @@ def card(title: str) -> tuple[QFrame, QVBoxLayout]:
 
 
 def build_main_window(window: "MainWindow") -> None:
-    """在 GUI 线程装配只读画面和任务面板；不加载模型或授予设备输入。"""
-    window.setWindowTitle("斗地主实验室 · 连续游戏工作台")
+    """在 GUI 主线程为 window 装配只读画面和任务面板，正常返回 None。
+
+    window 为持有设备与任务控制器的主窗口；本函数仅创建组件并绑定已有回调，
+    不加载模型、不连接手机，也不授予设备输入。中文主标题与品牌副标题分行展示，
+    避免完整项目名称占用同一行挤压连接状态与操作按钮。
+    """
+    window.setWindowTitle("王者荣耀自动斗地主机器人 · Doudizhu Lab · 连续游戏工作台")
     window.resize(1440, 900)
     window.setMinimumSize(1100, 720)
     window.setStyleSheet(STYLE)
@@ -63,8 +68,8 @@ def build_main_window(window: "MainWindow") -> None:
     header = QHBoxLayout()
     heading = QVBoxLayout()
     heading.setSpacing(4)
-    heading.addWidget(label("斗地主实验室", "title"))
-    heading.addWidget(label("连续游戏与录像回放", "subtitle"))
+    heading.addWidget(label("王者荣耀自动斗地主机器人", "title"))
+    heading.addWidget(label("Doudizhu Lab · 自动对局与录像回放", "subtitle"))
     header.addLayout(heading)
     header.addStretch()
     window.connection_label = label("未连接设备", "badge")

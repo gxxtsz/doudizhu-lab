@@ -209,7 +209,7 @@ class SessionDialog(QDialog):
         self.initial_folder = initial_folder
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="离线回放")
         self.cancel = Event()
-        self.setWindowTitle("录像回放 · 斗地主实验室")
+        self.setWindowTitle("王者荣耀自动斗地主机器人 · Doudizhu Lab · 录像回放")
         self.setStyleSheet(STYLE)
         self.resize(1380, 860)
         self.setMinimumSize(1100, 720)

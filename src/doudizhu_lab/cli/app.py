@@ -1,4 +1,4 @@
-"""桌面命令行入口；所有实际设备操作仍由窗口明确授权。"""
+"""王者荣耀自动斗地主机器人的桌面入口；显式开始任务后才授权自动输入。"""
 
 import argparse
 import sys
@@ -36,7 +36,11 @@ def main() -> None:
     """
     configure_console()
     parser = argparse.ArgumentParser(
-        description="斗地主实验室：沿用当前大厅，不限制玩法名称或场次等级；出牌仍按标准54张牌规则"
+        description=(
+            "王者荣耀自动斗地主机器人 · Doudizhu Lab：通过USB连接安卓手机，"
+            "结合画面识别与本地模型完成自动对局；沿用当前大厅或结算页，"
+            "不限制玩法名称或场次等级，出牌仍按标准54张牌规则"
+        )
     )
     parser.add_argument("--data-dir", type=Path, help="本地运行数据目录")
     parser.add_argument(
@@ -76,7 +80,9 @@ def main() -> None:
         "--acceptance", action="store_true", help="以已冻结版本记录独立验收批次，需配合 --record"
     )
     parser.add_argument("--quit-after", type=int, help="指定秒数后退出并保存运行统计，用于稳定性验证")
-    parser.add_argument("--version", action="version", version=f"斗地主实验室 {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"王者荣耀自动斗地主机器人 · Doudizhu Lab {__version__}"
+    )
     args = parser.parse_args()
     if args.time_limit is not None:
         print("提示：--time-limit 已弃用并忽略，连续任务仅按设定局数结束。", file=sys.stderr)

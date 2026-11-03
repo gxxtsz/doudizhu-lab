@@ -1,4 +1,4 @@
-"""中文命令行诊断入口：只读设备检查、单帧导出和人工标注集评测。"""
+"""王者荣耀自动斗地主机器人的中文诊断入口：设备检查、组件准备与离线评测。"""
 
 from __future__ import annotations
 
@@ -18,15 +18,25 @@ from doudizhu_lab.vision.cards import Recognizer
 
 
 def main() -> None:
-    """提供可复现诊断命令；本入口不包含任何自动点击或自动出牌功能。"""
+    """解析命令行并执行设备诊断、组件准备或离线评测。
+
+    本函数不接收 Python 参数，选项及路径从进程命令行读取；正常完成返回 None，
+    参数解析或诊断失败可通过 SystemExit 返回非零退出码。设备检查只读取状态，
+    组件准备可显式联网并写入本机目录，评测按指定路径保存报告；所有子命令均不
+    授予手机自动输入权限，也不发送自动点击或出牌命令。
+    """
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     # Windows 重定向时错误流也必须使用 UTF-8，避免中文失败原因与正常输出编码混杂。
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="斗地主实验室 · 诊断")
+    parser = argparse.ArgumentParser(
+        description="王者荣耀自动斗地主机器人 · Doudizhu Lab：设备诊断、组件准备与离线评测"
+    )
     parser.add_argument("--data-dir", type=Path, help="运行数据目录")
-    parser.add_argument("--version", action="version", version=f"斗地主实验室 {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"王者荣耀自动斗地主机器人 · Doudizhu Lab {__version__}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("devices", help="列出设备及授权状态")
     capture = sub.add_parser("capture", help="获取一帧并导出截图及识别 JSON")

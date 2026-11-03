@@ -165,7 +165,7 @@ class DemoWindow(MainWindow):
         super().__init__(store, auto_refresh=False, auto_load_model=False, auto_preview=False)
         self.input_gate = InputGate(transport="simulation")
         self.client = None
-        self.setWindowTitle("斗地主实验室 · 离线模拟")
+        self.setWindowTitle("王者荣耀自动斗地主机器人 · Doudizhu Lab · 离线模拟")
         self.available_devices = [Device("simulation", "device", "本地模拟")]
         self.selected_device = self.available_devices[0]
         self.log("本地模拟器已就绪；模型就绪后可以开始模拟牌局。")
@@ -408,10 +408,19 @@ class ContinuousNativeCheck(QObject):
 
 
 def main() -> None:
-    """启动无需手机的原生窗口演示；模型与配置使用本机 data，演示日志独立保存。"""
+    """在 GUI 主线程解析命令行并启动无需手机的原生模拟窗口。
+
+    本函数不接收 Python 参数，模型、配置目录与演示选项从进程命令行读取；模型
+    及配置使用指定本机目录，演示日志独立保存。参数错误或窗口事件循环结束通过
+    SystemExit 返回相应退出码；演示仅操作隔离模拟设备，不查询或连接真实手机。
+    """
     configure_console()
-    parser = argparse.ArgumentParser(description="本地机器人模拟窗口，不连接手机")
-    parser.add_argument("--version", action="version", version=f"斗地主实验室 {__version__}")
+    parser = argparse.ArgumentParser(
+        description="王者荣耀自动斗地主机器人 · Doudizhu Lab：本地离线模拟窗口，不连接手机"
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"王者荣耀自动斗地主机器人 · Doudizhu Lab {__version__}"
+    )
     parser.add_argument("--data-dir", type=Path, help="演示数据与模型所在目录，不连接手机")
     parser.add_argument(
         "--play-model", choices=tuple(PLAY_MODEL_NAMES), help="本次模拟的出牌模型，不保存偏好"
