@@ -444,12 +444,16 @@ class MainWindow(QMainWindow):
         self.task_status = self._finish_status
         if self._saved_folder:
             if getattr(self, "_recording_result", None) and self._recording_result.reason == StopReason.FAULT:
-                self.message = "异常录像及诊断资料已保留，可打开本次回放"
+                fault = self._recording_result.primary_fault or {}
+                self.message = fault.get("message", "程序异常") + "；录像及诊断资料已保留，可打开本次回放"
             self.log("录像已保存，可打开本次回放")
         elif getattr(self, "_recording_result", None):
             result = self._recording_result
             self.message = (
-                "故障资料已保存；本次未取得可播放录像"
+                (
+                    (result.primary_fault or {}).get("message", "程序异常")
+                    + "；故障资料已保存，本次未取得可播放录像"
+                )
                 if result.reason == StopReason.FAULT
                 else "本次临时录像已清理，运行摘要已保存"
             )
@@ -616,7 +620,10 @@ class MainWindow(QMainWindow):
         if state:
             self._table_state = asdict(state) if not isinstance(state, dict) else dict(state)
         if snapshot.get("stopped") and not self._stop_requested:
-            self.stop_and_save("视频已中断，已保留片段与缺口，请检查连接", outcome="failed")
+            fault = snapshot.get("primary_fault") or {}
+            self.stop_and_save(
+                fault.get("message", "视频已中断，已保留片段与缺口，请检查连接"), outcome="failed"
+            )
 
     def dashboard_state(self) -> DashboardState:
         """在 GUI 线程复制展示数据，不解析状态文案；未知角色、行动与牌数不作推测。"""
@@ -648,7 +655,11 @@ class MainWindow(QMainWindow):
         if self.continuous and not self._stop_requested and status not in ("stopped", "completed", "failed"):
             progress = self.continuous.progress()
             status = progress.status if progress.status != "idle" else status
-            notice = (self._resume_error or progress.reason) if progress.status == "paused" else self.message
+            notice = (
+                (self._resume_error or progress.reason)
+                if progress.status == "paused"
+                else (progress.reason if progress.startup_phase == "waiting_lobby" else self.message)
+            )
         settings = self.store.profile.continuous_settings
         scene = SCENE_NAMES.get(progress.scene, "等待确认画面") if progress else "等待开始"
         total = progress.total if progress else settings["max_games"]

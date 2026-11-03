@@ -9,8 +9,9 @@ import stat
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from time import sleep
-from uuid import uuid4
+from time import monotonic
+
+from doudizhu_lab.storage.json_io import atomic_json as atomic_json
 
 
 class StopReason(StrEnum):
@@ -23,29 +24,17 @@ class StopReason(StrEnum):
 
 @dataclass(frozen=True)
 class RecordingResult:
-    """后台收尾结果；无媒体时回放路径为空，摘要和故障资料仍可独立存在。"""
+    """后台收尾结果；无媒体时回放路径为空，摘要和故障资料仍可独立存在。
+
+    primary_fault为最早发生的故障对象，供界面保留首因；无故障或旧调用时为空。
+    所有路径来自本次会话收尾，不授权读取之外的设备操作。
+    """
 
     summary_path: Path
     replay_folder: Path | None
     reason: StopReason
     diagnostics_folder: Path | None = None
-
-
-def atomic_json(path: Path, value) -> None:
-    """在目标目录内原子发布中文 JSON；独立临时名避免并发写入互相覆盖临时文件。"""
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        for attempt in range(5):
-            try:
-                temporary.replace(path)
-                break
-            except PermissionError as exc:
-                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 4:
-                    raise
-                sleep(0.01 * (attempt + 1))
-    finally:
-        temporary.unlink(missing_ok=True)
+    primary_fault: dict | None = None
 
 
 def checked_tree(path: Path, root: Path) -> Path:
@@ -120,6 +109,7 @@ class RetentionLedger:
             "windows": self.windows,
             "active": self.active,
             "faults": self.faults,
+            "primary_fault": min(self.faults, key=lambda f: f["occurred_at"]) if self.faults else None,
             "removed_segments": self.removed,
             "discard_before_us": self.frontier,
             "reason": self.reason,
@@ -145,14 +135,19 @@ class RetentionLedger:
         self.active = {"game_id": "", "start_us": pts_us, "end_us": None}
         self.persist()
 
-    def fault(self, code: str, message: str, *, health=None) -> bool:
-        """固定当前窗口并登记首个同类故障；返回是否为新故障，供尾录计时使用。"""
+    def fault(self, code: str, message: str, *, health=None, occurred_at: float | None = None) -> bool:
+        """固定当前窗口并登记同类首个故障；返回是否新增，不延长外层尾录截止时间。
+
+        occurred_at为本机源进程单调时间，省略时取当前时刻；value按该时间展示首因，
+        与控制命令交付顺序无关。调用方须持有录像锁，持久化失败原样上抛。
+        """
         if any(f["code"] == code for f in self.faults):
             return False
         self.faults.append(
             {
                 "code": code,
                 "message": message,
+                "occurred_at": monotonic() if occurred_at is None else occurred_at,
                 "pts_us": self.last_pts,
                 "game_id": self.active["game_id"],
                 "health": health or {},
@@ -253,4 +248,6 @@ def finalize_retention(folder: Path, root: Path, *, runtime: dict | None = None)
             )
             raise
     replay = folder if not discard and playable_video(folder) else None
-    return RecordingResult(summary, replay, reason, folder if not discard else None)
+    return RecordingResult(
+        summary, replay, reason, folder if not discard else None, value.get("primary_fault")
+    )

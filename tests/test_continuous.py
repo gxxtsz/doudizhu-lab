@@ -19,7 +19,7 @@ from doudizhu_lab.runtime.continuous import ContinuousRuntime
 from doudizhu_lab.simulation.continuous import ContinuousSimPipeline
 from doudizhu_lab.storage.config import Profile, Store
 from doudizhu_lab.storage.runs import evaluate_run, uncovered_video_intervals
-from doudizhu_lab.vision.flow import FlowRecognizer
+from doudizhu_lab.vision.flow import FlowButton, FlowRecognizer
 
 
 class LegalTestAgent:
@@ -208,6 +208,8 @@ def test_cold_foreground_probe_waits_without_input_then_requires_valid_evidence(
 
 
 def test_confirmed_ending_animation_keeps_observing_without_input_and_has_bound(run):
+    # 正常任务的结算等待仍有十秒保护；中途启动的等待在独立用例覆盖。
+    run.runtime.startup_phase, run.runtime.lobby_confirmed = "ready", True
     run.tick()
     initial = run.pipeline.flow_snapshot()
     start = run.clock()
@@ -246,6 +248,97 @@ def test_entering_midgame_without_confirmed_lobby_cannot_arm_bot(run, legacy_ver
     flow = replace(run.pipeline.flow_snapshot(), mode_verified=legacy_verified)
     run.runtime.advance(flow, run.pipeline.bot_snapshot())
     assert run.runtime.status == "paused" and "大厅" in run.runtime.reason
+
+
+def startup_frame(run, scene, *, buttons=(), elapsed=0.12, age=0, snapshot=None):
+    """注入同一模拟设备的新页面；真实输入仍经过生产闸门和模拟设备坐标校验。"""
+    run.now[0] += elapsed
+    run.pipeline._phase("lobby")
+    run.pipeline.tick()
+    frame = replace(run.pipeline.frame, started=run.clock() - age)
+    run.pipeline.frame = frame
+    flow = replace(run.pipeline.flow, frame=frame, scene=scene, buttons=buttons)
+    run.pipeline.flow, run.pipeline.phase = flow, scene
+    run.gate.heartbeat()
+    run.runtime.advance(flow, snapshot)
+    return flow
+
+
+def test_midgame_start_waits_without_input_then_returns_and_plays_next_complete_game(run):
+    incomplete = SimpleNamespace(
+        state={"game_id": "ignored-midgame", "capture_incomplete": True, "pending": True}
+    )
+    for scene in ("dealing", "bidding", "doubling", "playing", "ending"):
+        startup_frame(run, scene, snapshot=incomplete)
+    assert run.runtime.active and run.runtime.startup_phase == "waiting_lobby"
+    assert not run.pipeline.flow_commands and not run.runtime.current_game and not run.runtime.completed
+    assert "等待" in run.runtime.progress().reason and run.gate.owner is None
+    back = FlowButton("return_lobby", "返回大厅", PixelRect(150, 65, 100, 25), True)
+    continue_button = FlowButton("continue", "继续游戏", PixelRect(450, 65, 100, 25), True)
+    first = startup_frame(run, "settlement", buttons=(continue_button, back))
+    for _ in range(5):
+        run.runtime.advance(first, incomplete)
+    assert not run.pipeline.flow_commands
+    startup_frame(run, "settlement", buttons=(continue_button, back))
+    assert run.pipeline.flow_commands == [("settlement", "return_lobby")]
+    match = FlowButton("match", "开始匹配", PixelRect(450, 65, 100, 25), True)
+    startup_frame(run, "lobby", buttons=(match,))
+    startup_frame(run, "lobby", buttons=(match,))
+    assert run.runtime.startup_phase == "ready" and run.runtime.lobby_confirmed
+    assert run.pipeline.flow_commands[-1] == ("lobby", "match")
+    run.runtime.settings["max_games"] = 1
+    for _ in range(3000):
+        run.tick()
+        if not run.runtime.active:
+            break
+    assert run.runtime.status == "completed" and len(run.runtime.completed) == 1
+    assert all(kind != "continue" for _, kind in run.pipeline.flow_commands)
+    report = evaluate_run(run.runtime.store.folder)
+    assert report["completed_games"] == 1 and not report["pauses"]
+
+
+@pytest.mark.parametrize("label", [None, "继续游戏", "返回", "退出"])
+def test_startup_settlement_without_explicit_back_button_keeps_waiting(run, label):
+    for index in range(3):
+        kind = "continue" if label == "继续游戏" else "return_lobby"
+        buttons = () if label is None else (FlowButton(kind, label, PixelRect(150, 65, 100, 25), True),)
+        startup_frame(run, "settlement", buttons=buttons, elapsed=6)
+    assert run.runtime.active and run.runtime.startup_phase == "waiting_lobby"
+    assert not run.pipeline.flow_commands and not run.runtime.completed
+
+
+def test_startup_rejects_stale_back_button_and_waiting_limit_is_normal_completion(run):
+    startup_frame(run, "playing")
+    back = FlowButton("return_lobby", "返回大厅", PixelRect(150, 65, 100, 25), True)
+    startup_frame(run, "settlement", buttons=(back,), age=1.1)
+    assert not run.pipeline.flow_commands and run.runtime.active
+    run.runtime.settings["time_limit"] = 1
+    startup_frame(run, "playing", elapsed=2)
+    assert run.runtime.status == "completed" and not run.runtime.completed
+    assert "时间上限" in run.runtime.reason and not run.pipeline.flow_commands
+
+
+@pytest.mark.parametrize("cause", ["device", "pipeline", "popup"])
+def test_waiting_for_lobby_still_reports_real_failures(run, cause):
+    startup_frame(run, "playing")
+    if cause == "device":
+        run.pipeline.allowed = False
+    elif cause == "pipeline":
+        run.pipeline.failed = True
+    else:
+        flow = run.pipeline.flow_snapshot()
+        run.runtime.advance(replace(flow, blocked_reason="游戏健康系统要求休息"), None)
+        assert run.runtime.status == "paused"
+        return
+    startup_frame(run, "playing")
+    assert run.runtime.status == "paused" and not run.pipeline.flow_commands
+
+
+def test_user_can_stop_waiting_without_starting_any_game(run):
+    startup_frame(run, "playing")
+    run.runtime.stop()
+    assert run.runtime.status == "stopped" and not run.pipeline.flow_commands
+    assert run.gate.owner is None and run.runtime.startup_phase == "waiting_lobby"
 
 
 def test_video_coverage_distinguishes_closed_containers_from_whole_game():

@@ -208,6 +208,8 @@ class ContinuousSimPipeline:
             }
             spec = specs.get(self.phase)
             buttons = (FlowButton(*spec, True),) if spec else ()
+            if self.phase == "settlement":
+                buttons += (FlowButton("return_lobby", "返回大厅", PixelRect(150, 65, 100, 25), True),)
             if self.bid_enabled and self.phase == "bidding":
                 if self.clock() < self.bid_wait_until:
                     buttons = ()
@@ -305,7 +307,7 @@ class ContinuousSimPipeline:
                     self.fault = ""
                 elif button.kind == "decline_double":
                     self._phase("playing")
-                elif button.kind == "continue":
+                elif button.kind in ("continue", "return_lobby"):
                     self._phase("lobby")
                 elif button.kind == "close_showcase":
                     self._phase("settlement")

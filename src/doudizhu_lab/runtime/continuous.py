@@ -16,7 +16,11 @@ from doudizhu_lab.vision.flow import SCENE_NAMES
 
 @dataclass(frozen=True)
 class ContinuousProgress:
-    """任务界面的只读进度；时间单位为秒，completed 只统计已确认完成的牌局。"""
+    """任务界面的只读进度；时间单位为秒，completed 只统计已确认完成的牌局。
+
+    startup_phase为waiting_lobby时仅等待首次大厅并可返回大厅，为ready后才授权
+    新局流程；默认ready兼容旧调用。等待仍属于running，GUI保留停止按钮。
+    """
 
     status: str
     scene: str
@@ -25,6 +29,7 @@ class ContinuousProgress:
     total: int
     elapsed: float
     time_limit: int
+    startup_phase: str = "ready"
 
 
 class ContinuousRuntime:
@@ -56,6 +61,7 @@ class ContinuousRuntime:
         self.identity = None
         # 仅记录是否观察到有效大厅入口，不验证玩法名称或场次等级，也不跨任务恢复。
         self.lobby_confirmed = False
+        self.startup_phase = "waiting_lobby"
         self._finish_wait = None
         self._ready_since = None
         self.close_window_requested = False
@@ -85,6 +91,7 @@ class ContinuousRuntime:
                 self.settings["max_games"],
                 max(0, self.clock() - self.started),
                 self.settings["time_limit"],
+                self.startup_phase,
             )
             return self._progress_cache
         finally:
@@ -115,6 +122,9 @@ class ContinuousRuntime:
             if hasattr(self.pipeline, "enable_automatic_retention"):
                 self.pipeline.enable_automatic_retention()
             self.status, self.started = "running", self.clock()
+            self.reason = "等待当前牌局结束并返回大厅"
+            self.store.set("startup_phase", self.startup_phase)
+            self.store.add("startup_wait_started", at=self.started)
             self.scene_since = self.last_new_at = self.started
             self.bot.attach(self.pipeline)
             self.bot.set_mode("suggest")
@@ -280,12 +290,68 @@ class ContinuousRuntime:
             or self.clock() - self.started >= self.settings["time_limit"]
         )
 
+    def _wait_for_lobby(self, flow) -> bool:
+        """处理本任务首次大厅确认前的只读等待；True表示本帧已消费，不进入单局授权。
+
+        稳定大厅入口允许开始新局；当前牌局及准备页面仅观察，明确结算页只开放
+        返回大厅按钮。所有实际点击仍由原有双帧、时效和发送前检查负责。本局不写
+        game_complete，也不把缺少开局历史计作程序故障。该方法在流程线程锁内调用。
+        """
+        if self.startup_phase != "waiting_lobby":
+            return False
+        if self._limited():
+            self._complete("等待大厅期间已达到任务时间上限")
+            return True
+        if flow.scene in ("lobby", "room"):
+            button = next((b for b in flow.buttons if b.kind == "match" and b.enabled), None)
+            self.reason = "正在确认大厅入口" if button else "等待可确认的大厅匹配入口"
+            if button is None:
+                self.candidate = None
+                return True
+            signature = (f"{self.scene_epoch}:match:{button.label}", button.hit.x // 15, button.hit.y // 15)
+            if not self.candidate or self.candidate[0] != signature:
+                self.candidate = (signature, flow.frame.media_pts_us)
+                return True
+            if flow.frame.media_pts_us - self.candidate[1] < 100_000:
+                return True
+            self.startup_phase, self.lobby_confirmed, self.reason = "ready", True, ""
+            self.store.set("startup_phase", self.startup_phase)
+            self.store.add(
+                "startup_wait_finished",
+                frame_id=flow.frame.frame_id,
+                pts_us=flow.frame.media_pts_us,
+                at=self.clock(),
+            )
+            return False
+        if flow.scene in ("unknown", "matching"):
+            # 无法识别的页面仍使用原有五秒规则，不能用等待大厅掩盖识别故障。
+            self.reason = "等待确认当前页面并返回大厅"
+            return False
+        if flow.scene == "settlement":
+            has_return = any(
+                b.kind == "return_lobby" and b.label == "返回大厅" and b.enabled for b in flow.buttons
+            )
+            self.reason = (
+                "正在确认返回大厅按钮" if has_return else "本局已结束，等待返回大厅按钮；也可手动返回"
+            )
+            if not has_return:
+                self.candidate = None
+                return True
+            return False
+        self.reason = "等待当前牌局结束并返回大厅"
+        self.candidate = None
+        self.gate.revoke()
+        return True
+
     def advance(self, flow, snapshot):
         """消费一个最新同帧观察；相同帧不增加稳定次数，超时由单调时钟而非帧数判断。"""
         with self.lock:
             if not self.active:
                 return
             now = self.clock()
+            if self.startup_phase == "waiting_lobby" and self._limited():
+                self._complete("等待大厅期间已达到任务时间上限")
+                return
             if not self.bot.ready.is_set():
                 if self.bot.thread and not self.bot.thread.is_alive():
                     self.pause(self.bot.status)
@@ -448,6 +514,8 @@ class ContinuousRuntime:
                     if now - pending["sent_at"] > (8 if wait_for_evidence else 3):
                         self.pause("页面操作在证据等待窗口内仍无法唯一确认，禁止重复点击")
                     return
+            if self._wait_for_lobby(flow):
+                return
             if flow.scene == "unknown":
                 if now - self.scene_since > 5:
                     self.pause("未知页面持续五秒")
@@ -515,7 +583,9 @@ class ContinuousRuntime:
                     b
                     for kind in preferences.get(flow.scene, ())
                     for b in flow.buttons
-                    if b.kind == kind and b.enabled
+                    if b.kind == kind
+                    and b.enabled
+                    and (self.startup_phase != "waiting_lobby" or b.label == "返回大厅")
                 ),
                 None,
             )

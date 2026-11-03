@@ -282,6 +282,45 @@ def test_typed_recording_result_controls_replay_and_cleanup_message(window, back
 
 
 @pytest.mark.gui
+def test_recording_final_result_displays_first_fault(window, backend, qtbot, tmp_path):
+    backend.pipeline.finalize_recording = Mock(
+        return_value=RecordingResult(
+            tmp_path / "摘要.json",
+            tmp_path / "录像",
+            StopReason.FAULT,
+            primary_fault={"code": "health_report", "message": "采集状态连续三秒不可读取"},
+        )
+    )
+    window.start_continuous()
+    qtbot.waitUntil(lambda: window.continuous is not None)
+    window.stop_and_save()
+    qtbot.waitUntil(lambda: window.recording is None and not window.busy)
+    assert "采集状态连续三秒不可读取" in window.notice_label.text()
+    assert window.task_status == "failed"
+
+
+@pytest.mark.gui
+def test_waiting_lobby_notice_keeps_stop_available(window, backend, qtbot):
+    window.start_continuous()
+    qtbot.waitUntil(lambda: window.continuous is not None)
+    window.continuous.progress = lambda: ContinuousProgress(
+        "running",
+        "playing",
+        "等待当前牌局结束并返回大厅",
+        0,
+        5,
+        10,
+        1800,
+        "waiting_lobby",
+    )
+    window.render_dashboard()
+    assert "等待当前牌局结束" in window.notice_label.text()
+    assert window.stop_button.isEnabled() and not window.action_button.isEnabled()
+    window.stop_and_save()
+    qtbot.waitUntil(lambda: window.recording is None and not window.busy)
+
+
+@pytest.mark.gui
 def test_continuous_shutdown_failure_pins_diagnostics(window, backend, qtbot):
     backend.pipeline.report_failure = Mock()
     window.start_continuous()

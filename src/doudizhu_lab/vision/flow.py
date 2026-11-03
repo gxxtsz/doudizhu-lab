@@ -262,16 +262,28 @@ class FlowRecognizer:
         outside[by : by + box.height, bx : bx + box.width] = False
         return bool(outside.any() and np.mean(color[outside]) > 0.45)
 
-    def observe(self, frame, table=None, *, room="当前", deal_id="", ended=False):
+    def observe(
+        self,
+        frame,
+        table=None,
+        *,
+        room="当前",
+        deal_id="",
+        ended=False,
+        tracked_phase: tuple[str, str] | None = None,
+    ):
         """只读识别当前源帧，返回与 frame 绑定的 FlowObservation，不发送设备输入。
 
         table 仅在 frame_id 相同时提供阶段和手牌证据；deal_id、ended 只提示结算扫描。
+        tracked_phase 为(源frame_id, 已确认阶段)，不同帧时忽略。该提示只补充同帧已
+        确认出牌状态，不修改table，不覆盖明确结算、充值或健康系统等阻断页面。
         room 仅为旧接口兼容而保留，任何参数值均不限制玩法和场次。大厅只根据明确
         匹配按钮识别；切场弹窗必须给出唯一明确目标，充值或购买提示始终阻断。
         按钮仍须独立通过文字分数、区域及底色校验。
         实例由流程识别线程独占；出牌阶段仅检查托管区域，OCR 初始化或推理异常上抛。
         """
         table = table or {}
+        tracked_playing = tracked_phase == (frame.frame_id, "playing")
         if not hasattr(self, "_known_end_deals"):
             self._known_end_deals, self._end_latched = set(), False
         if ended and deal_id not in self._known_end_deals:
@@ -468,6 +480,24 @@ class FlowRecognizer:
                 else ("dealing" if board_shell else "unknown")
             )
         # 页面已知但文字冲突时不开放按钮；尤其不能把叫抢的“不抢”转成“不出”。
+        if (
+            tracked_playing
+            and not self._ending_scan
+            and phase != "settlement"
+            and scene
+            in (
+                "unknown",
+                "dealing",
+                "bidding",
+                "doubling",
+            )
+        ):
+            x = int(frame.width * 0.82)
+            managed = self._text(frame.rgb[: int(frame.height * 0.14), x:], (x, 0))
+            blocked = (
+                "检测到游戏内托管，不能计为机器人出牌" if any("取消托管" in t[0] for t in managed) else ""
+            )
+            return FlowObservation(frame, "playing", texts=texts, blocked_reason=blocked)
         allowed = {
             "lobby": {"match"},
             "room": {"match"},

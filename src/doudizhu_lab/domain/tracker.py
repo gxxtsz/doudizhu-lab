@@ -273,13 +273,72 @@ class GameTracker:
         signature = repr(value)
         previous = self._stable.get(key)
         if previous is None or previous[0] != signature:
-            self._stable[key] = (signature, pts, 1, value, pts)
+            self._stable[key] = (signature, pts, 1, value, pts, [self._last_frame])
             return None
-        self._stable[key] = (signature, previous[1], previous[2] + 1, value, pts)
+        frames = (previous[5] + [self._last_frame])[-2:]
+        self._stable[key] = (signature, previous[1], previous[2] + 1, value, pts, frames)
         return value if previous[2] >= 1 and pts - previous[1] >= self.config.stable_us else None
 
     def _first(self, key, default):
         return self._stable.get(key, (None, default))[1]
+
+    def _opening_evidence(self, obs, hand, counts, cards) -> dict | None:
+        """以完整开局后的首轮稳定证据确认出牌开始，不依赖本人按钮是否已经出现。
+
+        仅使用领域数据和纯牌型规则：地主必须领出，牌面与剩牌差分均已通过至少
+        100ms的双帧稳定，自己领出还须核对手牌差分。返回源证据，绝不修改原观察、
+        凭空补牌或解除历史缺口；无法确认时返回None继续等待现有阶段证据。
+        """
+        if (
+            self._active_started
+            or not self._role_initialized
+            or self.state.pending
+            or self.state.capture_incomplete
+            or self.state.ended
+            or not self.state.initial_hand
+        ):
+            return None
+        role = self.state.landlord
+        if role not in SEATS or len(self.order) != 3:
+            return None
+        if len(self.state.initial_hand) != (20 if role == "self" else 17):
+            return None
+        before, after, value = self._counts[role], counts[role], cards[role]
+        if before is None or after is None or not value or before - after != len(value):
+            return None
+        if role == "self" and (
+            hand is None
+            or self._hand is None
+            or Counter(self._hand) - Counter(hand) != Counter(value)
+            or Counter(hand) - Counter(self._hand)
+        ):
+            return None
+        # 固定的第三方纯牌型算法不加载模型、不产生设备输入；2与大小王使用非连续编码，
+        # 防止把包含2或王的序列当成顺子。普通出牌仍沿用现有守恒和轮转校验。
+        from doudizhu_lab._vendor.douzero.env.move_generator import MovesGener
+
+        numbers = {rank: index + 3 for index, rank in enumerate(RANKS[:12])} | {"2": 17, "SJ": 20, "BJ": 30}
+        encoded = sorted(numbers[c] for c in value)
+        if not any(sorted(move) == encoded for move in MovesGener(encoded).gen_moves()):
+            return None
+        probe = apply_event(
+            self.state, {"game_id": self.state.game_id, "kind": "setup", "data": {"current_actor": role}}
+        )
+        probe = apply_event(
+            probe, {"game_id": self.state.game_id, "kind": "play", "seat": role, "cards": value}
+        )
+        if probe.pending:
+            return None
+        return {
+            "seat": role,
+            "cards": list(value),
+            "before_count": before,
+            "after_count": after,
+            "first_evidence_us": self._first("count_" + role, obs.pts_us),
+            "evidence_frames": list(
+                dict.fromkeys(self._stable["play_" + role][5] + self._stable["count_" + role][5])
+            ),
+        }
 
     def _event(
         self,
@@ -761,6 +820,11 @@ class GameTracker:
         actor = self._value("actor", obs.actor, obs.pts_us)
         counts = {s: self._value("count_" + s, obs.remaining.get(s), obs.pts_us) for s in SEATS}
         cards = {s: self._value("play_" + s, canonical(obs.plays.get(s)), obs.pts_us) for s in SEATS}
+        # 已进入出牌后，残留的准备动画不能重开同一副手牌。新17张手牌仍可明确
+        # 标识漏观察结算后的下一局；正常结算后的新局沿用既有边界规则。
+        if self._active_started and not self.state.ended and phase in ("dealing", "bidding", "doubling"):
+            if phase == "doubling" or hand is None or len(hand) != 17 or hand == self._hand:
+                phase = None
         preparation = phase in ("dealing", "bidding")
         redeal = self._redeal_boundary(obs, phase or self._phase, hand)
         new_game = bool(
@@ -801,10 +865,29 @@ class GameTracker:
                         self.order = ["self", second, third]
                         self._event(update, obs, "setup", data={"seat_order": self.order})
         self._setup(update, obs, phase, hand, bottom, landlord, counts)
+        opening = (
+            self._opening_evidence(obs, hand, counts, cards)
+            if phase in (None, "dealing", "bidding", "doubling")
+            else None
+        )
+        if opening is not None:
+            phase = "playing"
+            self._active_started = True
+            self._event(
+                update,
+                obs,
+                "setup",
+                data={"current_actor": opening["seat"]},
+                first_us=opening["first_evidence_us"],
+            )
         if phase and phase != self._phase and not (self._active_started and phase == "doubling"):
             self._phase = phase
             self._event(
-                update, obs, "phase", data={"phase": phase}, first_us=self._first("phase", obs.pts_us)
+                update,
+                obs,
+                "phase",
+                data={"phase": phase} | ({"basis": "stable_opening_play", **opening} if opening else {}),
+                first_us=opening["first_evidence_us"] if opening else self._first("phase", obs.pts_us),
             )
         if self._phase == "playing":
             if self.state.current_actor is None and not self.state.turn and actor:

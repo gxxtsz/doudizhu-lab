@@ -103,9 +103,11 @@ class RecordingPipeline:
         self.retention = None if self.remote_capture else RetentionLedger(self.session.folder)
         self._health_stop = threading.Event()
         self._health_lock = threading.Lock()
+        self._diagnostic_lock = threading.Lock()
         self._gui_at = None
         self._stages = {}
         self._faults = {}
+        self._fault_details = []
         self._completed_games = set()
         self._last_health = {}
         self._dumped = False
@@ -205,23 +207,53 @@ class RecordingPipeline:
                 "decode": self.decode_queue.qsize(),
                 "analysis": self.analysis_pool.size if self.analysis_pool else 0,
             },
+            "channel_warnings": self.stream.channel.snapshot() if self.remote_capture else {},
+            "capture_lifecycle": self._last_health.get("lifecycle"),
         }
 
-    def report_failure(self, code: str, message: str) -> None:
-        """先固定故障及最近状态，再尝试截图和线程转储；后续用户停止不能撤销此决定。"""
-        if code in self._faults:
-            return
-        self._faults[code] = message
-        self.failed = True
+    def report_failure(self, code: str, message: str, *, occurred_at: float | None = None) -> None:
+        """先固定故障及最近状态，再尝试截图和堆栈；用户停止不能撤销故障。
+
+        occurred_at仅用于传递本机录制进程已记录的单调故障时间，默认取当前时刻；
+        按发生时间展示首因，不能用跨进程交付顺序覆盖更早的真实故障。不发送输入。
+        """
+        with self._health_lock:
+            if code in self._faults:
+                return
+            detail = {
+                "code": code,
+                "message": message,
+                "occurred_at": monotonic() if occurred_at is None else occurred_at,
+                "pts_us": self._pts,
+            }
+            self._faults[code] = message
+            self._fault_details.append(detail)
+            self._fault_details.sort(key=lambda f: f["occurred_at"])
+            self.failed = True
         health = self.health_snapshot()
         if self.remote_capture:
-            self.stream.command("fault", code=code, message=message, health=health)
+            self.stream.command(
+                "fault", code=code, message=message, health=health, occurred_at=detail["occurred_at"]
+            )
         else:
             self.retention.last_pts = self._pts
-            self.retention.fault(code, message, health=health)
+            self.retention.fault(code, message, health=health, occurred_at=detail["occurred_at"])
         self.messages.put(message)
         try:
-            atomic_json(self.session.folder / "故障诊断.json", {"faults": self._faults, "health": health})
+            # 发布单独串行化，不能持有健康锁等待磁盘；每次实际发布前重新取完整
+            # 故障集，防止较早回调迟到覆盖已经登记的首因或后续故障。
+            with self._diagnostic_lock:
+                with self._health_lock:
+                    faults, details = dict(self._faults), list(self._fault_details)
+                atomic_json(
+                    self.session.folder / "故障诊断.json",
+                    {
+                        "faults": faults,
+                        "primary_fault": details[0],
+                        "secondary_faults": details[1:],
+                        "health": health,
+                    },
+                )
             if self.frame is not None:
                 self.evidence.submit(self.frame, ["runtime-fault"])
             if not self._dumped:
@@ -273,7 +305,7 @@ class RecordingPipeline:
                 self.allowed = status.get("allowed", False)
                 self.record_ready.set() if status.get("record_ready") else self.record_ready.clear()
                 for fault in status.get("faults", []):
-                    self.report_failure(fault["code"], fault["message"])
+                    self.report_failure(fault["code"], fault["message"], occurred_at=fault.get("occurred_at"))
                 if self.stream.process and self.stream.process.poll() is not None and not self.closed:
                     self.report_failure("capture_exit", "独立录像进程提前退出")
             except Exception as exc:
@@ -318,6 +350,9 @@ class RecordingPipeline:
                         table,
                         deal_id=deal_id,
                         ended=ended,
+                        tracked_phase=(snapshot.frame.frame_id, snapshot.state["phase"])
+                        if snapshot
+                        else None,
                     )
                     with self._snapshot_lock:
                         self._flow_snapshot = result
@@ -787,6 +822,7 @@ class RecordingPipeline:
             "stopped": self.stop_event.is_set() or self.failed,
             "health": self._last_health,
             "failed": self.failed,
+            "primary_fault": dict(self._fault_details[0]) if self._fault_details else None,
             "metrics": dict(self.metrics),
             "allowed": self.allowed,
             "events": events,
@@ -880,10 +916,13 @@ class RecordingPipeline:
                 value = json.loads(path.read_text(encoding="utf-8"))
                 value.update(reason=StopReason.FAULT)
                 value["faults"] = value.get("faults", []) + [
-                    {"code": code, "message": message, "pts_us": self._pts}
-                    for code, message in self._faults.items()
-                    if not any(f["code"] == code for f in value.get("faults", []))
+                    detail
+                    for detail in self._fault_details
+                    if not any(f["code"] == detail["code"] for f in value.get("faults", []))
                 ]
+                value["primary_fault"] = min(
+                    value["faults"], key=lambda f: f.get("occurred_at", float("inf"))
+                )
                 atomic_json(path, value)
         else:
             self.retention.last_pts = self._pts
