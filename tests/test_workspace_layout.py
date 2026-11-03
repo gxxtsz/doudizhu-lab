@@ -46,12 +46,25 @@ for width, height in ((1440, 900), (1100, 720)):
             assert w.rect().contains(QRect(button.mapTo(w, QPoint()), button.size()))
         assert w.canvas.width() >= 440 and w.canvas.height() >= 260
         w.grab().save(str(out / f"运行-{width}-{status}.png"))
-d = SettingsDialog(w)
-d.show()
-app.processEvents()
-assert d.rect().contains(QRect(d.buttons.mapTo(d, QPoint()), d.buttons.size()))
-d.grab().save(str(out / "设置.png"))
-d.close()
+w.task_status = "idle"
+for legacy in (False, True):
+    if legacy:
+        w.store.profile.bid_settings.update(mode="model", call_threshold=0.2, rob_threshold=0.5, reclaim_threshold=0.6)
+    d = SettingsDialog(w)
+    d.show()
+    app.processEvents()
+    assert (d.width(), d.height()) == (540, 650)
+    assert not d.form_scroll.isAncestorOf(d.buttons)
+    viewport = d.form_scroll.viewport()
+    for field in (d.devices, d.adb_path, d.bid_threshold, d.games):
+        d.form_scroll.ensureWidgetVisible(field, 0, 0)
+        app.processEvents()
+        assert viewport.rect().contains(QRect(field.mapTo(viewport, QPoint()), field.size())), (field, viewport.size())
+        assert d.rect().contains(QRect(d.buttons.mapTo(d, QPoint()), d.buttons.size()))
+    d.form_scroll.ensureWidgetVisible(d.bid_threshold, 0, 0)
+    app.processEvents()
+    d.grab().save(str(out / ("设置-旧配置.png" if legacy else "设置.png")))
+    d.close()
 r = SessionDialog(w.store)
 r.resize(1100, 720)
 r.show()

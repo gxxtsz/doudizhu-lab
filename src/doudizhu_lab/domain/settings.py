@@ -10,6 +10,8 @@ from doudizhu_lab.domain.models import NormalizedRect, TrackerSettings
 FLOW_ROOMS: tuple[str, ...] = ("初级", "中级", "高级")
 PLAY_MODEL_NAMES = {"resnet": "ResNet", "wp": "WP"}
 CONFIGURATION_VERSION = 7
+# 保留按阶段存储的配置键；设置页统一赋值，旧配置仍可保留三个不同的阈值。
+BID_THRESHOLD_KEYS: tuple[str, ...] = ("call_threshold", "rob_threshold", "reclaim_threshold")
 
 
 def parse_max_games(text: str) -> int:
@@ -30,13 +32,31 @@ def parse_max_games(text: str) -> int:
     return games
 
 
-def default_bid_settings() -> dict[str, str | float]:
-    """旧配置默认仍不叫抢；显式选模型后使用分别可调的首叫、抢地主及回抢阈值。
+def parse_bid_threshold(text: str) -> float:
+    """将统一叫抢阈值文本解析为 [-10, 10] 内的有限浮点数，非法时抛出中文 ValueError。
 
-    首叫0.2、首次抢0.5沿用上游起点；回抢提高到0.6是本工具稳健策略，并非经过本游戏
-    胜率校准的最优值。三个值均为原始评分阈值，不是概率，暂不改变不加倍策略。
+    text 接受首尾空白、小数和科学计数法，返回 Python float，不额外舍入，也不将
+    模型原始评分解释为胜率。空文本、非数字、非有限值及超范围输入均被拒绝。
+    本接口是线程无关的纯解析函数，不修改配置、不访问设备，也不发送输入。
     """
-    return {"mode": "disabled", "call_threshold": 0.2, "rob_threshold": 0.5, "reclaim_threshold": 0.6}
+    message = "叫抢阈值必须为 -10～10 之间的有限数值"
+    try:
+        value = float(text.strip())
+    except ValueError as exc:
+        raise ValueError(message) from exc
+    if not np.isfinite(value) or not -10 <= value <= 10:
+        raise ValueError(message)
+    return value
+
+
+def default_bid_settings() -> dict[str, str | float]:
+    """返回独立的默认叫抢配置；默认拒绝叫抢，三个阶段的阈值统一为 0.5。
+
+    仅用于新配置或缺少整个叫抢配置时补齐，不覆盖已保存的分阶段阈值。
+    0.5 沿用原首次抢地主的起点，属于模型原始评分而非胜率或校准后的最优值。
+    调用不访问磁盘、模型或设备，不授予执行权限，也不改变始终不加倍的策略。
+    """
+    return {"mode": "disabled", "call_threshold": 0.5, "rob_threshold": 0.5, "reclaim_threshold": 0.5}
 
 
 def default_regions() -> dict[str, NormalizedRect]:
@@ -123,7 +143,8 @@ class Profile:
 def validate_bot_profile(profile: Profile) -> None:
     """只读检验配置，合法时返回 None，字段无效时抛出 ValueError。
 
-    profile 可保持未完成的操作标定，但不能含负数、非有限值或放宽后的超时。
+    profile 可保持未完成的操作标定；叫抢阈值允许 [-10, 10] 内的有限数值，且满足
+    首叫 ≤ 首次抢 ≤ 回抢，以兼容旧配置。其他布局比例及超时沿用各自的正值约束。
     flow_room 为已弃用的兼容字段，不作为玩法、场次或输入授权的校验条件。
     连续任务仅接受一个 max_games 正整数字段，不设局数上限；bool 不作为整数接受。
     本函数不修改配置、不访问设备，可在加载配置或 GUI 保存前调用，不授予输入权限。
@@ -138,9 +159,9 @@ def validate_bot_profile(profile: Profile) -> None:
         raise ValueError("叫抢策略配置无效")
     if any(
         type(bidding[k]) not in (int, float) or not np.isfinite(bidding[k]) or not -10 <= bidding[k] <= 10
-        for k in ("call_threshold", "rob_threshold", "reclaim_threshold")
+        for k in BID_THRESHOLD_KEYS
     ):
-        raise ValueError("叫抢阈值必须是有限原始评分")
+        raise ValueError("叫抢阈值必须为 -10～10 之间的有限数值")
     if not bidding["call_threshold"] <= bidding["rob_threshold"] <= bidding["reclaim_threshold"]:
         raise ValueError("稳健叫抢策略要求首叫阈值不高于抢地主及回抢阈值")
     if profile.continuous_policy not in ("strict", "infer", "balanced"):

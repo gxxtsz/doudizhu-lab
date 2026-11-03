@@ -19,6 +19,7 @@ from doudizhu_lab.agents.bidding import (
     verify_bid_model,
 )
 from doudizhu_lab.domain.models import Frame, PixelRect
+from doudizhu_lab.domain.settings import parse_bid_threshold
 from doudizhu_lab.runtime.bot import BotRuntime, InputGate
 from doudizhu_lab.runtime.continuous import ContinuousRuntime
 from doudizhu_lab.simulation.continuous import ContinuousSimPipeline
@@ -126,7 +127,9 @@ def test_fixed_model_scores_match_published_net2_and_never_randomly_fallback(tmp
 
 def test_only_distinct_consistent_frames_allow_call_and_reclaim_threshold():
     agent = ScoreAgent(0.55)
-    c = controller(agent)
+    # 显式保留旧版分阶段配置，验证默认值统一后仍兼容不同阈值。
+    settings = default_bid_settings() | {"mode": "model", "call_threshold": 0.2, "reclaim_threshold": 0.6}
+    c = BiddingController(settings, agent, threaded=False)
     assert c.choose(flow(0), "one") is None
     assert c.choose(flow(0), "one") is None
     call = c.choose(flow(120), "one")
@@ -140,6 +143,53 @@ def test_only_distinct_consistent_frames_allow_call_and_reclaim_threshold():
     agent.value = 9
     assert c.choose(flow(480, prompt="rob"), "one") == rob
     c.close()
+
+
+@pytest.mark.parametrize("stage", ["call", "rob", "reclaim"])
+@pytest.mark.parametrize("score,positive", [(0.7, False), (0.75, False), (0.8, True)])
+def test_custom_shared_threshold_controls_all_stages_with_strict_comparison(stage, score, positive):
+    """真实决策器按自定义统一阈值比较，评分相等也拒绝；回抢经首叫提交反馈进入。"""
+    settings = {"mode": "model", "call_threshold": 0.75, "rob_threshold": 0.75, "reclaim_threshold": 0.75}
+    agent = ScoreAgent(1)
+    c = BiddingController(settings, agent, threaded=False)
+    try:
+        if stage == "reclaim":
+            assert c.choose(flow(0), "one") is None
+            call = c.choose(flow(120), "one")
+            assert call.kind == "call_landlord"
+            c.committed(call, "one")
+        agent.value = score
+        prompt = "call" if stage == "call" else "rob"
+        assert c.choose(flow(240, prompt=prompt), "one") is None
+        decision = c.choose(flow(360, prompt=prompt), "one")
+        assert decision.stage == stage and decision.threshold == 0.75 and decision.score == score
+        expected = ("call_landlord" if stage == "call" else "rob_landlord") if positive else "decline_bid"
+        assert decision.kind == expected
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("-10", -10),
+        ("10", 10),
+        ("0", 0),
+        (" 0.5 ", 0.5),
+        ("1e-7", 0.0000001),
+        ("0.12345678901234567", 0.12345678901234567),
+    ],
+)
+def test_shared_threshold_parser_accepts_range_and_preserves_precision(text, expected):
+    assert parse_bid_threshold(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text", ["", " ", "abc", "零", "nan", "NaN", "inf", "-inf", "1e309", "-10.001", "10.001"]
+)
+def test_shared_threshold_parser_rejects_invalid_text_with_chinese_reason(text):
+    with pytest.raises(ValueError, match="叫抢阈值必须为 -10～10 之间的有限数值"):
+        parse_bid_threshold(text)
 
 
 def test_changed_hand_resets_stability_and_waits_before_scoring():
@@ -340,7 +390,13 @@ def test_old_configuration_remains_decline_and_is_backed_up_before_upgrade(tmp_p
     text = json.dumps({"version": 4, "profile": old})
     store.settings_path.write_text(text, encoding="utf8")
     loaded = Store(tmp_path)
-    assert loaded.profile.bid_settings["mode"] == "disabled"
+    assert loaded.profile.bid_settings == {
+        "mode": "disabled",
+        "call_threshold": 0.5,
+        "rob_threshold": 0.5,
+        "reclaim_threshold": 0.5,
+    }
+    assert loaded.settings_path.read_text(encoding="utf8") == text
     loaded.save()
     assert (tmp_path / "settings.before-bidding.bak.json").read_text(encoding="utf8") == text
 

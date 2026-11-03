@@ -401,6 +401,125 @@ def test_invalid_game_count_stays_in_settings_and_preserves_configuration(window
 
 
 @pytest.mark.gui
+@pytest.mark.parametrize("text", ["-10", "0", " 0.12345678901234567 ", "1e-7", "10"])
+def test_shared_bid_threshold_roundtrip_and_reopen_preserves_calibration(window, qtbot, text):
+    """通过设置保存并重新加载统一阈值，其他配置和第七版格式保持完整。"""
+    original = deepcopy(window.store.profile)
+    dialog = SettingsDialog(window)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    assert dialog.bid_threshold.text() == "0.5" and not dialog.bid_threshold.isEnabled()
+    dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
+    assert dialog.bid_threshold.isEnabled()
+    dialog.bid_threshold.setText(text)
+    dialog.save()
+    assert not dialog.isVisible()
+    saved = Store(window.store.root)
+    expected = deepcopy(original)
+    expected.bid_settings = {
+        "mode": "model",
+        "call_threshold": float(text),
+        "rob_threshold": float(text),
+        "reclaim_threshold": float(text),
+    }
+    assert saved.settings_version == 7 and saved.profile == expected
+    reopened = SettingsDialog(window)
+    qtbot.addWidget(reopened)
+    assert float(reopened.bid_threshold.text()) == float(text)
+    reopened.reject()
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("text", ["", " ", "abc", "nan", "inf", "-inf", "1e309", "-10.001", "10.001"])
+def test_invalid_shared_bid_threshold_keeps_form_and_saved_configuration(window, qtbot, text):
+    window.store.save()
+    original = deepcopy(window.store.profile)
+    before = window.store.settings_path.read_bytes()
+    dialog = SettingsDialog(window)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
+    dialog.bid_threshold.setText(text)
+    dialog.save()
+    assert dialog.isVisible() and "叫抢阈值必须为 -10～10" in dialog.error.text()
+    assert dialog.bid_threshold.text() == text and window.store.profile == original
+    assert window.store.settings_path.read_bytes() == before
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("mode", ["disabled", "model"])
+@pytest.mark.parametrize("text", ["", " ", "0.375", "0.5"])
+def test_legacy_stage_thresholds_only_change_when_shared_value_is_provided(window, qtbot, mode, text):
+    """旧配置在留空及仅改局数时保持原值，显式填写同于原首次抢阈值也能统一。"""
+    legacy = {"mode": mode, "call_threshold": 0.2, "rob_threshold": 0.5, "reclaim_threshold": 0.6}
+    window.store.profile.bid_settings = dict(legacy)
+    window.store.save()
+    assert Store(window.store.root).profile.bid_settings == legacy
+    dialog = SettingsDialog(window)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    assert dialog.bid_threshold.text() == "" and "留空保留原设置" in dialog.bid_threshold.placeholderText()
+    assert any("首叫 0.2、首次抢 0.5、回抢 0.6" in item.text() for item in dialog.findChildren(QLabel))
+    if text.strip():
+        dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
+    dialog.bid_threshold.setText(text)
+    dialog.games.setText("7")
+    dialog.save()
+    assert not dialog.isVisible()
+    saved = Store(window.store.root)
+    expected = (
+        {
+            "mode": "model",
+            "call_threshold": float(text),
+            "rob_threshold": float(text),
+            "reclaim_threshold": float(text),
+        }
+        if text.strip()
+        else legacy
+    )
+    assert saved.profile.bid_settings == expected
+    assert saved.profile.continuous_settings == {"max_games": 7}
+    reopened = SettingsDialog(window)
+    qtbot.addWidget(reopened)
+    assert reopened.bid_threshold.text() == (str(float(text)) if text.strip() else "")
+    reopened.reject()
+
+
+@pytest.mark.gui
+def test_bidding_mode_switch_and_sync_preserve_pending_shared_threshold(window, qtbot):
+    dialog = SettingsDialog(window)
+    qtbot.addWidget(dialog)
+    dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
+    dialog.bid_threshold.setText("0.375")
+    dialog.bidding.setCurrentIndex(dialog.bidding.findData("disabled"))
+    assert not dialog.bid_threshold.isEnabled() and dialog.bid_threshold.text() == "0.375"
+    dialog.sync()
+    dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
+    assert dialog.bid_threshold.isEnabled() and dialog.bid_threshold.text() == "0.375"
+    dialog.bidding.setCurrentIndex(dialog.bidding.findData("disabled"))
+    dialog.save()
+    assert Store(window.store.root).profile.bid_settings == {
+        "mode": "disabled",
+        "call_threshold": 0.375,
+        "rob_threshold": 0.375,
+        "reclaim_threshold": 0.375,
+    }
+
+
+@pytest.mark.gui
+def test_cancel_shared_threshold_edit_does_not_publish_preferences(window, qtbot):
+    window.store.save()
+    original = deepcopy(window.store.profile)
+    before = window.store.settings_path.read_bytes()
+    dialog = SettingsDialog(window)
+    qtbot.addWidget(dialog)
+    dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
+    dialog.bid_threshold.setText("0.375")
+    dialog.buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
+    assert window.store.profile == original and window.store.settings_path.read_bytes() == before
+
+
+@pytest.mark.gui
 @pytest.mark.parametrize("total", [31, 2**31, 2**64, 10**100])
 @pytest.mark.parametrize("portion", [0, 1, 2])
 def test_dashboard_scales_large_targets_without_integer_overflow(window, total, portion):
@@ -415,6 +534,7 @@ def test_dashboard_scales_large_targets_without_integer_overflow(window, total, 
 
 @pytest.mark.gui
 def test_settings_are_readonly_for_every_recording_phase(window, backend, qtbot):
+    window.store.profile.bid_settings["mode"] = "model"
     window.start_continuous()
     dialog = SettingsDialog(window)
     qtbot.addWidget(dialog)
@@ -422,6 +542,7 @@ def test_settings_are_readonly_for_every_recording_phase(window, backend, qtbot)
         window.task_status = status
         dialog.sync()
         assert not dialog.task.isEnabled() and not dialog.connection.isEnabled()
+        assert not dialog.bid_threshold.isEnabled()
         assert not dialog.buttons.button(QDialogButtonBox.StandardButton.Save).isEnabled()
     qtbot.waitUntil(lambda: window.continuous is not None)
     with pytest.raises(ValueError):
@@ -432,13 +553,22 @@ def test_settings_are_readonly_for_every_recording_phase(window, backend, qtbot)
 
 @pytest.mark.gui
 def test_failed_settings_save_rolls_back_memory(window, monkeypatch, qtbot):
+    window.store.save()
+    before = window.store.settings_path.read_bytes()
     original = window.store.profile
     monkeypatch.setattr(window.store, "save", Mock(side_effect=OSError("磁盘不可写")))
     dialog = SettingsDialog(window)
     qtbot.addWidget(dialog)
+    dialog.show()
+    dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
+    dialog.bid_threshold.setText("0.375")
     dialog.games.setText("20")
     dialog.save()
     assert window.store.profile is original and "磁盘不可写" in dialog.error.text()
+    assert (
+        original.bid_settings["call_threshold"] == 0.5 and window.store.settings_path.read_bytes() == before
+    )
+    assert dialog.isVisible() and dialog.bid_threshold.text() == "0.375"
 
 
 @pytest.mark.gui
