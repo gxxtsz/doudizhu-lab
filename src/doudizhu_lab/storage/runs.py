@@ -282,6 +282,134 @@ def verify_flow_transition(sent: dict, confirmed: dict, observations: dict[str, 
         return False
 
 
+def audit_game_evidence(
+    game: dict,
+    events: list[dict],
+    raw_events: list[dict],
+    observations: dict[str, dict],
+    actions: list[dict],
+    *,
+    evidence_version: int = 2,
+    policy: str = "strict",
+    source: str = "live_bot",
+) -> dict:
+    """独立复核一局的分局、推断和单次实际提交，运行完成门槛与离线报告共用。
+
+    game 只提供 game_id/degraded，不信任其 verified 或 strict_complete。events 为
+    独立运行事件，raw_events/observations 必须来自不可变原始账本；actions 是实际
+    执行账本。函数不读写数据库、不操作手机、不修改参数，失败返回按本局归属的错误。
+    第二版要求唯一原始分局绑定；缺少版本的旧资料由调用方传入 1，保留旧确认口径。
+    """
+    from dataclasses import asdict
+
+    from doudizhu_lab.domain.round_evidence import resolve_round_binding
+    from doudizhu_lab.domain.tracker import GameState, apply_event
+
+    gid = game["game_id"]
+    history = [e for e in events if e["game_id"] == gid]
+    records = [a for a in actions if a.get("game_id") == gid]
+    openings = [e for e in history if e["kind"] == "game_start"]
+    binding = resolve_round_binding(openings[0], raw_events, observations) if len(openings) == 1 else None
+    binding_errors = [gid] if evidence_version >= 2 and binding is None else []
+    inference_errors = []
+    before = GameState()
+    for event in history:
+        if event.get("source") == "operational_inferred":
+            declared = event.get("data", {}).get("round_binding")
+            if (
+                (evidence_version >= 2 and binding is None)
+                or (declared is not None and (binding is None or declared != asdict(binding)))
+                or not verify_inference(
+                    event, before, observations, expected_context=binding.frame_context if binding else None
+                )
+            ):
+                inference_errors.append(event["event_id"])
+        before = apply_event(before, event)
+    moves = [e for e in history if e["kind"] in ("play", "pass") and e.get("confirmed", True)]
+    expected = {n: e for n, e in enumerate(moves) if e["seat"] == "self"}
+    starts = {a["action_id"]: a for a in records if a["stage"] == "开始"}
+    confirmations = [a for a in records if a["stage"] == "已确认"]
+    rejected = {
+        (a["action_id"], a.get("frame_id"), a.get("kind")) for a in records if a["stage"] == "输入未发送"
+    }
+    attempts = Counter(
+        (a["action_id"], a.get("frame_id"), a.get("kind"))
+        for a in records
+        if a["stage"] in ("命令已返回", "命令结果未知") and a.get("kind") in ("play", "pass")
+    )
+    submitted = {}
+    turns = []
+    submission_errors = []
+    for record in records:
+        key = record["action_id"], record.get("frame_id"), record.get("kind")
+        if record["stage"] != "准备输入" or record.get("kind") not in ("play", "pass") or key in rejected:
+            continue
+        ident = record["action_id"]
+        submitted.setdefault(ident, []).append(record)
+        turns.append(starts.get(ident, {}).get("decision", {}).get("turn"))
+        if evidence_version >= 2 and attempts[key] != 1:
+            submission_errors.append(ident)
+    good = set()
+    for confirmation in confirmations:
+        ident = confirmation["action_id"]
+        decision = starts.get(ident, {}).get("decision", {})
+        turn = decision.get("turn")
+        sends = submitted.get(ident, [])
+        sent = sends[0] if len(sends) == 1 else {}
+        actual = evidence_version < 2 or bool(
+            sent
+            and ident not in submission_errors
+            and turn in expected
+            and sent.get("kind") == expected[turn]["kind"] == ("play" if decision.get("cards") else "pass")
+            and expected[turn]["pts_us"] > sent["pts_us"]
+            and confirmation["pts_us"]
+            >= (expected[turn].get("data", {}).get("confirmed_at_us") or expected[turn]["pts_us"])
+        )
+        if (
+            turn in expected
+            and Counter(decision.get("cards", [])) == Counter(expected[turn]["cards"])
+            and confirmation.get("source") == source
+            and actual
+        ):
+            good.add(turn)
+        elif decision.get("strategy", "wp") != "rules":
+            submission_errors.append(ident)
+    duplicates = sum(n - 1 for n in Counter(turns).values() if n > 1)
+    valid = bool(expected and set(expected) == good == set(turns) and before.complete and not duplicates)
+    if game.get("degraded") and policy == "balanced":
+        confirmed = {a["action_id"]: a for a in confirmations}
+        valid = bool(starts and set(starts) == set(confirmed) == set(submitted) and not duplicates)
+        for ident, start in starts.items():
+            if ident not in confirmed or len(submitted.get(ident, [])) != 1:
+                valid = False
+                continue
+            decision = start["decision"]
+            sent = submitted[ident][0]
+            actual = evidence_version < 2 or ident not in submission_errors
+            if decision.get("strategy", "wp") == "rules":
+                actual = actual and verify_rule_feedback(start, sent, confirmed[ident], observations)
+                if evidence_version >= 2 and binding is not None:
+                    actual = actual and all(
+                        observations.get(f, {}).get("frame_context") == binding.frame_context
+                        for f in confirmed[ident].get("feedback", {}).get("frames", [])
+                    )
+            else:
+                actual = actual and decision["turn"] in good
+            valid = valid and actual and confirmed[ident].get("source") == source
+    valid = bool(valid and not inference_errors and not binding_errors and not submission_errors)
+    return {
+        "game_id": gid,
+        "passed": valid,
+        "own_events": len(expected),
+        "confirmed_submissions": len(good),
+        "inference_proof_errors": inference_errors,
+        "submission_proof_errors": sorted(set(submission_errors)),
+        "binding_errors": binding_errors,
+        "duplicate_submissions": duplicates,
+        "round_binding": asdict(binding) if binding else None,
+    }
+
+
 def evaluate_run(folder, *, output=None):
     """只读评测任务；模拟结果单独标记，实时完成还要求录像正常收尾及无采集缺口。"""
     folder = Path(folder)
@@ -348,7 +476,7 @@ def evaluate_run(folder, *, output=None):
     game_audits = []
     policy = meta.get("profile", {}).get("continuous_policy", "strict")
     operational_events, actions, events = [], [], []
-    inference_errors, flow_proof_errors, submission_errors = [], [], []
+    inference_errors, flow_proof_errors, submission_errors, binding_errors = [], [], [], []
     db_path = session / "session.sqlite3"
     if db_path.exists():
         with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
@@ -372,6 +500,7 @@ def evaluate_run(folder, *, output=None):
                 if policy != "strict" or meta.get("evidence_policy_version", 1) >= 2
                 else {}
             )
+        raw_events = events
         if operational_events:
             events = operational_events
         sends_by_id = {s["action_id"]: s for s in sends}
@@ -428,104 +557,28 @@ def evaluate_run(folder, *, output=None):
                 for g in games
             )
         ]
-        # 独立重放原事件并核对每一次自己的动作，不能只相信game_complete声称的verified。
-        from doudizhu_lab.domain.tracker import GameState, apply_event, replay_events
-
-        before = GameState()
-        round_contexts = {}
-        for event in events:
-            if event["kind"] == "game_start":
-                round_contexts[event["game_id"]] = observation_map.get(event["frame_id"], {}).get(
-                    "frame_context"
-                )
-            if event.get("source") == "operational_inferred":
-                context = round_contexts.get(event["game_id"])
-                if (
-                    meta.get("evidence_policy_version", 1) >= 2
-                    and (not context or not context.get("round_id"))
-                ) or not verify_inference(event, before, observation_map, expected_context=context):
-                    inference_errors.append(event["event_id"])
-            before = apply_event(before, event)
-
-        states = replay_events(events)
-        expected_source = "simulation_bot" if simulation else "live_bot"
-        for game in games:
-            gid = game["game_id"]
-            moves = [
-                e
-                for e in events
-                if e["game_id"] == gid and e["kind"] in ("play", "pass") and e.get("confirmed", True)
-            ]
-            expected = {n: e for n, e in enumerate(moves) if e["seat"] == "self"}
-            good = set()
-            for action in actions:
-                if action.get("game_id") != gid or action["stage"] != "已确认":
-                    continue
-                decision = starts.get(action["action_id"], {})
-                turn = decision.get("turn")
-                action_sends = submitted_records.get(action["action_id"], [])
-                sent = action_sends[0] if len(action_sends) == 1 else {}
-                actual_submission = meta.get("evidence_policy_version", 1) < 2 or bool(
-                    sent
-                    and action["action_id"] not in submission_errors
-                    and turn in expected
-                    and sent.get("kind")
-                    == expected[turn]["kind"]
-                    == ("play" if decision.get("cards") else "pass")
-                    and expected[turn]["pts_us"] > sent["pts_us"]
-                    and action["pts_us"]
-                    >= (expected[turn].get("data", {}).get("confirmed_at_us") or expected[turn]["pts_us"])
-                )
-                if (
-                    turn in expected
-                    and Counter(decision.get("cards", [])) == Counter(expected[turn]["cards"])
-                    and action.get("source") == expected_source
-                    and actual_submission
-                ):
-                    good.add(turn)
-            actual = {turn for game_id, turn in submissions if game_id == gid}
-            valid = bool(expected and set(expected) == good == actual and states.get(gid, {}).get("complete"))
-            if game.get("degraded") and policy == "balanced":
-                game_starts = {
-                    a["action_id"]: a for a in actions if a.get("game_id") == gid and a["stage"] == "开始"
-                }
-                confirmations = {
-                    a["action_id"]: a for a in actions if a.get("game_id") == gid and a["stage"] == "已确认"
-                }
-                sent = {
-                    a["action_id"]: a
-                    for a in actions
-                    if a.get("game_id") == gid
-                    and a["stage"] == "准备输入"
-                    and a.get("kind") in ("play", "pass")
-                }
-                valid = bool(game_starts and set(game_starts) == set(confirmations) == set(sent))
-                for ident, start in game_starts.items():
-                    if ident not in confirmations or ident not in sent:
-                        valid = False
-                        continue
-                    decision = start["decision"]
-                    if meta.get("evidence_policy_version", 1) >= 2:
-                        valid = (
-                            valid
-                            and ident not in submission_errors
-                            and len(submitted_records.get(ident, [])) == 1
-                        )
-                    if decision.get("strategy", "wp") == "rules":
-                        valid = valid and verify_rule_feedback(
-                            start, sent[ident], confirmations[ident], observation_map
-                        )
-                    else:
-                        valid = valid and decision["turn"] in good
-                valid = valid and all(a.get("source") == expected_source for a in confirmations.values())
-            game_audits.append(
-                {
-                    "game_id": gid,
-                    "passed": valid,
-                    "own_events": len(expected),
-                    "confirmed_submissions": len(good),
-                }
+        # 完成前与收尾后都使用同一纯函数，错误直接归属到具体牌局。
+        game_by_id = {g["game_id"]: g for g in games}
+        audits = {
+            gid: audit_game_evidence(
+                game_by_id.get(gid, {"game_id": gid}),
+                events,
+                raw_events,
+                observation_map,
+                actions,
+                evidence_version=meta.get("evidence_policy_version", 1),
+                policy=policy,
+                source="simulation_bot" if simulation else "live_bot",
             )
+            for gid in dict.fromkeys(e["game_id"] for e in events if e["kind"] == "game_start")
+        }
+        inference_errors = [error for a in audits.values() for error in a["inference_proof_errors"]]
+        for game in games:
+            audit = audits.get(game["game_id"], {"game_id": game["game_id"], "passed": False})
+            game_audits.append(audit)
+            binding_errors.extend(audit.get("binding_errors", []))
+            submission_errors.extend(audit.get("submission_proof_errors", []))
+        submission_errors = sorted(set(submission_errors))
     if not simulation:
         index = session / "video/index.json"
         if index.exists():
@@ -595,6 +648,7 @@ def evaluate_run(folder, *, output=None):
         "valid_inferred_events": sum(e.get("source") == "operational_inferred" for e in operational_events)
         - len(inference_errors),
         "inference_proof_errors": inference_errors,
+        "binding_errors": binding_errors,
         "flow_proof_errors": flow_proof_errors,
         "submission_proof_errors": submission_errors,
         "completed_games": len(games),
@@ -674,7 +728,12 @@ def evaluate_task(folder, meta, events, *, output=None):
         "proof_errors": [
             {"session": a["session"].get("folder", ""), "kind": kind, "error": error}
             for a in audits
-            for kind in ("inference_proof_errors", "flow_proof_errors", "submission_proof_errors")
+            for kind in (
+                "inference_proof_errors",
+                "flow_proof_errors",
+                "submission_proof_errors",
+                "binding_errors",
+            )
             for error in a.get("report", {}).get(kind, [])
         ],
         "status": meta["status"],

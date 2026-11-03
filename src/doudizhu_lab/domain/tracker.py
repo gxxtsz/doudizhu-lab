@@ -361,6 +361,9 @@ class GameTracker:
         payload = dict(data or {})
         payload.setdefault("first_evidence_us", first_us)
         payload.setdefault("confirmed_at_us", obs.pts_us if confirmed else None)
+        # 语义首证据可能仍位于上一局编号下。另存实际确认帧，供运行与离线按同一
+        # 原始边界绑定新局；该引用不能代替原始观察及 first_evidence_us 的独立检查。
+        payload.setdefault("confirmed_frame_id", obs.frame_id if confirmed else None)
         payload.setdefault("evidence_frames", [frame_id or obs.frame_id])
         event = GameEvent(
             f"{self.state.game_id}-e{self._event_number:05d}",

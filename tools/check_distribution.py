@@ -31,6 +31,7 @@ def check_archive(path: Path) -> None:
         "agents/resnet_features.py",
         "agents/backends.py",
         "domain/inference.py",
+        "domain/round_evidence.py",
         "runtime/supervisor.py",
         "runtime/session_process.py",
         "runtime/process.py",

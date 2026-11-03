@@ -11,7 +11,7 @@ from uuid import uuid4
 from doudizhu_lab.agents.bidding import BidAgent, BiddingController, decision_dict, verify_bid_model
 from doudizhu_lab.devices.adb import InputRejected
 from doudizhu_lab.runtime.faults import FaultScope, RuntimeFault
-from doudizhu_lab.storage.runs import RunStore, evaluate_run
+from doudizhu_lab.storage.runs import RunStore, audit_game_evidence, evaluate_run
 from doudizhu_lab.vision.flow import SCENE_NAMES
 
 
@@ -106,6 +106,7 @@ class ContinuousRuntime:
         self.skipped = set()
         self.blocked_flow = blocked_flow
         self._boundary_probe = None
+        self._binding_wait_since = None
 
     @property
     def active(self):
@@ -275,6 +276,7 @@ class ContinuousRuntime:
 
     def _skip_round(self, code, reason):
         """隔离一次异常牌局并固定录像；重复观察只登记一次，保持流程观察线程运行。"""
+        self._binding_wait_since = None
         if not self.quarantined:
             self._boundary_probe = None
         self.quarantined = True
@@ -740,6 +742,26 @@ class ContinuousRuntime:
                     return
             if self._wait_for_entry(flow):
                 return
+            if (
+                snapshot
+                and snapshot.state.get("round_binding_ready") is False
+                and not snapshot.state.get("ended", False)
+                and flow.scene in ("dealing", "bidding", "doubling", "playing")
+            ):
+                # 原始确认迟到时，叫抢和加倍也只能观察；不能只拦住出牌线程。
+                if self._binding_wait_since is None:
+                    self._binding_wait_since = now
+                self.reason = "等待原始发牌边界确认，本局暂不发送输入"
+                if self.unattended:
+                    self.current_game = snapshot.state["game_id"]
+                if snapshot.state.get("round_binding_error") or now - self._binding_wait_since > 8:
+                    self.pause(
+                        "原始发牌边界无法唯一确认",
+                        scope=FaultScope.ROUND if snapshot.state["game_id"] else FaultScope.SESSION,
+                        code="round_binding_error",
+                    )
+                return
+            self._binding_wait_since = None
             if flow.scene == "unknown":
                 if now - self.scene_since > 5:
                     self.pause("未知页面持续五秒", scope=FaultScope.EXTERNAL, code="unknown_page")
@@ -1023,7 +1045,12 @@ class ContinuousRuntime:
                     code="bot_round_halted",
                 )
             return
-        if not state["landlord"] or not state["bottom"] or not state["initial_hand"]:
+        if (
+            not state["landlord"]
+            or not state["bottom"]
+            or not state["initial_hand"]
+            or state.get("round_binding_ready") is False
+        ):
             # 新旧局切换的跟踪候选可能早于稳定的身份/底牌快照；先等待取证，不猜底牌。
             startup_wait = 8 if self.pipeline.profile.continuous_policy != "strict" else 3
             if self.clock() - self.scene_since > startup_wait:
@@ -1110,6 +1137,27 @@ class ContinuousRuntime:
         start = next(
             (e["pts_us"] for e in snapshot.history if e["kind"] == "game_start"), snapshot.frame.media_pts_us
         )
+        opening = next((e for e in snapshot.history if e["kind"] == "game_start"), {})
+        evidence = self.pipeline.session.game_evidence(
+            self.current_game,
+            opening.get("data", {}).get("first_evidence_us", start),
+            snapshot.frame.media_pts_us,
+        )
+        audit = audit_game_evidence(
+            {"game_id": self.current_game, "degraded": rule_game},
+            **evidence,
+            evidence_version=2,
+            policy=self.pipeline.profile.continuous_policy,
+            source=getattr(self.pipeline, "bot_source", "live_bot"),
+        )
+        # 复核只读且可能等待数据库。停止在此期间到达时，不能迟到提交完成或清理媒体。
+        self.poll_stop_request()
+        if not self.active or self.pipeline.stop_event.is_set():
+            return False
+        if not audit["passed"]:
+            self.store.add("game_proof_rejected", **audit)
+            self.pause("本局独立证据复核失败，已隔离并保留媒体", scope=FaultScope.ROUND, code="proof_error")
+            return False
         self._commit(
             "game_complete",
             game_id=self.current_game,
@@ -1123,6 +1171,7 @@ class ContinuousRuntime:
             raw_visual_complete=not any(e.get("source") == "operational_inferred" for e in snapshot.history),
             inferred_events=sum(e.get("source") == "operational_inferred" for e in snapshot.history),
             strategy_counts=dict(Counter(d.get("strategy", "wp") for d in starts.values())),
+            evidence_audit=audit,
             frame_id=snapshot.frame.frame_id,
         )
         self.registered.add(self.current_game)

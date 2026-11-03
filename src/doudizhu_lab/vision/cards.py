@@ -247,6 +247,31 @@ class Recognizer:
             for b in red_stats[1:]
             if expected_height * 0.2 <= b[3] < expected_height * 0.85 and b[4] >= 8
         ]
+        # 桌面大王的 O 有时被抗锯齿切成左右两块。先恢复同一字母行，再数五个
+        # 纵向字母；否则两个 O 分量会占掉 R 的位置，生成仅含 JOKE 的截断候选。
+        # 只合并高度明显重合、水平紧邻且总宽仍符合单字母的分量；最终标签仍须
+        # 通过完整字形、颜色、阈值和分数差检查，不能把普通横排 10 直接当成王。
+        rows = []
+        for part in sorted(red_parts, key=lambda b: (b[1], b[0])):
+            x, y, w, h = part
+            merged = False
+            for i, (rx, ry, rw, rh) in enumerate(rows):
+                overlap = min(y + h, ry + rh) - max(y, ry)
+                left, right = min(x, rx), max(x + w, rx + rw)
+                gap = max(x, rx) - min(x + w, rx + rw)
+                if (
+                    overlap >= min(h, rh) * 0.8
+                    and max(h, rh) <= min(h, rh) * 1.4
+                    and 0 <= gap <= expected_height * 0.12
+                    and right - left <= expected_height * 0.6
+                ):
+                    top, bottom = min(y, ry), max(y + h, ry + rh)
+                    rows[i] = (left, top, right - left, bottom - top)
+                    merged = True
+                    break
+            if not merged:
+                rows.append(part)
+        red_parts = rows
         for x, y, w, h in red_parts:
             aligned = sorted(
                 [b for b in red_parts if b[1] >= y and abs(b[0] + b[2] / 2 - x - w / 2) < max(w * 0.45, 4)],

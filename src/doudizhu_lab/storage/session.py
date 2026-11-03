@@ -425,6 +425,48 @@ class SessionStore:
                 ),
             )
 
+    def game_evidence(self, game_id: str, start_us: int, end_us: int) -> dict:
+        """在同一数据库读快照内取单局审计材料，不改原观察或恢复任何输入授权。
+
+        时间范围使用运行开局的 first_evidence_us 至当前结算帧，包含开局首帧和原始
+        跟踪器迟到的确认帧。所有原始开局都参与唯一性检查，运行编号可以不同于原始
+        编号。读取量限制在本局；返回的新字典供纯函数复核，调用者必须检查停止请求。
+        """
+        with self.lock:
+            # 显式读事务保证分析线程的其他连接不会在两次查询之间改变本次审计视图。
+            self.db.execute("BEGIN")
+            try:
+
+                def rows(table):
+                    return [
+                        json.loads(r[0])
+                        for r in self.db.execute(
+                            f"SELECT payload FROM {table} WHERE game_id=? ORDER BY seq", (game_id,)
+                        )
+                    ]
+
+                events = rows("operational_events") or rows("events")
+                return {
+                    "events": events,
+                    "raw_events": [
+                        json.loads(r[0])
+                        for r in self.db.execute(
+                            "SELECT payload FROM events WHERE kind='game_start' ORDER BY seq"
+                        )
+                    ],
+                    "observations": {
+                        v["frame_id"]: v
+                        for r in self.db.execute(
+                            "SELECT payload FROM observations WHERE pts_us BETWEEN ? AND ? ORDER BY seq",
+                            (start_us, end_us),
+                        )
+                        for v in [json.loads(r[0])]
+                    },
+                    "actions": rows("bot_actions"),
+                }
+            finally:
+                self.db.rollback()
+
     def rows(self, table: str) -> list[dict]:
         """仅允许固定表名，返回追加顺序；不接受用户拼接 SQL。"""
         if table not in (

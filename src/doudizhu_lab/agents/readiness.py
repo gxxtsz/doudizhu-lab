@@ -21,6 +21,10 @@ def assess(snapshot) -> DecisionReadiness:
     from doudizhu_lab.agents.douzero import context
 
     state = snapshot.state
+    if state.get("round_binding_error"):
+        return DecisionReadiness("halt", state["round_binding_error"])
+    if state.get("round_binding_ready") is False:
+        return DecisionReadiness("wait", "等待原始发牌边界确认，尚未授予本局输入", True)
     if state.get("strategy") == "rules":
         from doudizhu_lab.agents.rules import context as rule_context
 

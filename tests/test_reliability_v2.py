@@ -265,6 +265,7 @@ def test_strict_completion_and_audit_accept_proved_passes_without_raw_rewrite(ru
     db.commit()
     altered = evaluate_run(run.runtime.store.folder)
     assert not altered["passed"] and recorded[1]["action_id"] in altered["submission_proof_errors"]
+    assert any(a["game_id"] == recorded[1]["game_id"] and not a["passed"] for a in altered["game_audits"])
 
 
 def test_continue_room_switch_is_positive_progress_without_reclick(run):

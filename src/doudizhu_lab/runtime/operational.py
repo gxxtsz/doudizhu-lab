@@ -9,6 +9,7 @@ from threading import RLock
 from doudizhu_lab.agents.rules import RuleRound, role_for
 from doudizhu_lab.domain.bot_types import SnapshotSequence, encode
 from doudizhu_lab.domain.inference import deductions, frame_context, make_proof, matches, verify_proof
+from doudizhu_lab.domain.round_evidence import resolve_round_binding
 from doudizhu_lab.domain.table import TableObservation
 from doudizhu_lab.domain.tracker import GameTracker, apply_event
 
@@ -35,7 +36,31 @@ class OperationalObserver:
         self.raw_anchors, self.raw_deal_anchors = [], []
         self.pending_proofs = {}
         self.round_context = None
+        self.round_binding = self.opening = None
+        self.binding_error = ""
+        self.boundary_observations = {}
         self.lock = RLock()
+
+    def _bind_round(self, snapshot):
+        """仅在首个动作以前关联原始开局；确认迟到时继续等证，不沿用上一局编号。"""
+        if self.opening is None or self.binding_error:
+            return
+        context = snapshot.observation.get("frame_context", {})
+        if self.round_binding is not None:
+            if context != self.round_context and not self.tracker.state.ended:
+                self.binding_error = "已绑定牌局的原始编号、设备或视频流发生变化"
+            return
+        if self.tracker.state.turn or self.tracker._active_started or self.open_submission is not None:
+            self.binding_error = "出牌开始前未能唯一绑定原始发牌边界"
+            return
+        binding = resolve_round_binding(self.opening, snapshot.history, self.boundary_observations)
+        if binding is None:
+            return
+        self.round_binding, self.round_context = binding, dict(binding.frame_context)
+        # 绑定前的观察可能仍带旧局号，不能用于新局的双帧证明。
+        self.anchors, self.deal_anchors = [], []
+        self.raw_anchors, self.raw_deal_anchors = [], []
+        self.pending_proofs.clear()
 
     def reject_submission(self, decision):
         """只在底层明确保证未发送时撤销占位；命令超时或结果未知不能调用。
@@ -71,6 +96,8 @@ class OperationalObserver:
         self.anchors = self._anchor_pair(self.raw_anchors, raw)
         if obs.phase in ("dealing", "bidding") and len(obs.hand or []) == 17:
             self.deal_anchors = self._anchor_pair(self.raw_deal_anchors, raw)
+        if self.opening is not None and (self.round_binding is None or self.binding_error):
+            return
         if self.round_context is not None and obs.frame_context != self.round_context:
             return  # 仍让直接观察器识别新局，但不跨原始分局边界拼接证明。
         for claim in deductions(self.tracker.state, self.anchors, deal_values=self.deal_anchors):
@@ -226,6 +253,11 @@ class OperationalObserver:
         self.last_frame = snapshot.frame.frame_id
         obs = TableObservation(**snapshot.observation)
         obs.frame_context = obs.frame_context or frame_context(snapshot.frame)
+        self.boundary_observations[obs.frame_id] = asdict(obs)
+        # 只保留有界开局查找窗口；已经确认的绑定独立保存，不依赖此缓存继续存在。
+        if len(self.boundary_observations) > 1024:
+            self.boundary_observations.pop(next(iter(self.boundary_observations)))
+        self._bind_round(snapshot)
         if snapshot.state["capture_incomplete"]:
             self.anchors, self.deal_anchors = [], []
             self.raw_anchors, self.raw_deal_anchors = [], []
@@ -256,7 +288,10 @@ class OperationalObserver:
                 self.submission_pts = None
                 raw = asdict(TableObservation(**snapshot.observation))
                 raw["frame_context"] = dict(obs.frame_context)
-                self.round_context = dict(obs.frame_context)
+                self.opening = asdict(event)
+                self.round_binding = self.round_context = None
+                self.binding_error = ""
+                self._bind_round(snapshot)
                 self.anchors = [raw]
                 self.raw_anchors = [raw]
                 self.deal_anchors = (
@@ -277,6 +312,8 @@ class OperationalObserver:
                         ):
                             raise ValueError("运行时确定性证明无法独立复核")
                         event.source = "operational_inferred"
+                        if self.round_binding is not None:
+                            event.data["round_binding"] = asdict(self.round_binding)
                         self.pending_proofs.pop((event.kind, event.seat), None)
                         break
             if event.confirmed:
@@ -284,6 +321,12 @@ class OperationalObserver:
             self.new_events.append(asdict(event))
             before = apply_event(before, event)
         state = asdict(update.state)
+        if self.opening is not None or not state["game_id"]:
+            state["round_binding_ready"] = self.round_binding is not None and not self.binding_error
+            state["round_binding_error"] = self.binding_error
+            if self.binding_error:
+                state["pending"] = True
+                state["problems"] = [*state["problems"], self.binding_error]
         if self.rule and self.rule.state["game_id"] != state["game_id"]:
             self.rule = None
             self.open_submission = None

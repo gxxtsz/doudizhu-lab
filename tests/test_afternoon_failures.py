@@ -62,6 +62,15 @@ def test_double_joker_highlight_has_known_unselected_edges():
 
 
 @pytest.mark.local_data
+def test_evening_big_joker_with_split_o_keeps_the_final_r():
+    """只读取显式本机资料，用当局冻结模板重识别，不降低阈值或加入私人模板。"""
+    *_, observation, recognition = recognize("20261103_205940_49d71a", "eb85c563-4578")
+    assert observation.plays["right"] == ["BJ"]
+    region = next(r for r in recognition.regions if r.region == "right")
+    assert len(region.cards) == 1 and region.cards[0].box.height >= 140
+
+
+@pytest.mark.local_data
 @pytest.mark.parametrize(
     "name,fid,card",
     [
