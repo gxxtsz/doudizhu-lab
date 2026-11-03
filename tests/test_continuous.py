@@ -104,24 +104,24 @@ def test_five_games_share_production_pipeline_and_audit_every_own_action(run):
     assert sum(k == "continue" for _, k in run.pipeline.flow_commands) == 4
 
 
-def test_thirty_game_target_cannot_pass_at_five_and_stops_exactly_at_thirty(run):
-    """局数上限与验收目标共用同一快照，验证29次衔接及到达30局后不再匹配。"""
-    run.runtime.settings.update(max_games=30, time_limit=14400)
-    run.pipeline.profile.continuous_settings.update(max_games=30, time_limit=14400)
+def test_target_above_thirty_cannot_pass_at_five_and_stops_at_requested_count(run):
+    """超过旧上限的任务必须完成全部31局，完成后不匹配第32局。"""
+    run.runtime.settings["max_games"] = 31
+    run.pipeline.profile.continuous_settings["max_games"] = 31
     run.runtime.store.set("profile", asdict(run.pipeline.profile))
     checked_five = False
     for _ in range(72000):
         run.tick()
         if len(run.runtime.completed) == 5 and not checked_five:
             result = evaluate_run(run.runtime.store.folder)
-            assert result["required_games"] == 30 and not result["passed"]
+            assert result["required_games"] == 31 and not result["passed"]
             checked_five = True
         if not run.runtime.active:
             break
     result = evaluate_run(run.runtime.store.folder)
     assert checked_five and result["passed"]
-    assert result["completed_games"] == 30 and result["transitions"] == 29
-    assert sum(k == "match" for _, k in run.pipeline.flow_commands) == 30
+    assert result["completed_games"] == 31 and result["transitions"] == 30
+    assert sum(k == "match" for _, k in run.pipeline.flow_commands) == 31
     before = len(run.pipeline.flow_commands)
     run.tick(10)
     assert len(run.pipeline.flow_commands) == before
@@ -307,15 +307,16 @@ def test_startup_settlement_without_explicit_back_button_keeps_waiting(run, labe
     assert not run.pipeline.flow_commands and not run.runtime.completed
 
 
-def test_startup_rejects_stale_back_button_and_waiting_limit_is_normal_completion(run):
+@pytest.mark.parametrize("elapsed", [1801, 14401])
+def test_startup_rejects_stale_back_button_and_waits_without_total_time_limit(run, elapsed):
     startup_frame(run, "playing")
     back = FlowButton("return_lobby", "返回大厅", PixelRect(150, 65, 100, 25), True)
     startup_frame(run, "settlement", buttons=(back,), age=1.1)
     assert not run.pipeline.flow_commands and run.runtime.active
-    run.runtime.settings["time_limit"] = 1
-    startup_frame(run, "playing", elapsed=2)
-    assert run.runtime.status == "completed" and not run.runtime.completed
-    assert "时间上限" in run.runtime.reason and not run.pipeline.flow_commands
+    startup_frame(run, "playing", elapsed=elapsed)
+    assert run.runtime.active and run.runtime.startup_phase == "waiting_lobby"
+    assert run.runtime.progress().elapsed >= elapsed
+    assert not run.runtime.completed and not run.pipeline.flow_commands
 
 
 @pytest.mark.parametrize("cause", ["device", "pipeline", "popup"])
@@ -503,15 +504,21 @@ def test_transient_candidate_waits_but_true_history_gap_halts(run):
     assert assess(snapshot).status == "halt"
 
 
-def test_time_limit_finishes_current_game_and_does_not_match_again(run):
+@pytest.mark.parametrize("elapsed", [1801, 14401])
+def test_elapsed_time_does_not_stop_current_game_or_prevent_next_game(run, elapsed):
+    """模拟已运行超过旧时限，局内和局间均继续，达到两局目标才结束。"""
+    run.runtime.settings["max_games"] = 2
     playing(run)
-    run.runtime.settings["time_limit"] = 1
-    for _ in range(3000):
+    # 仅把任务起点设到过去；源帧和阶段时钟正常推进，避免伪造采集或动作确认超时。
+    run.runtime.started = run.clock() - elapsed
+    run.tick()
+    assert run.runtime.active and run.runtime.progress().elapsed >= elapsed
+    for _ in range(6000):
         run.tick()
         if not run.runtime.active:
             break
-    assert run.runtime.status == "completed" and len(run.runtime.completed) == 1
-    assert sum(k == "match" for _, k in run.pipeline.flow_commands) == 1
+    assert run.runtime.status == "completed" and len(run.runtime.completed) == 2
+    assert sum(k == "match" for _, k in run.pipeline.flow_commands) == 2
     assert not evaluate_run(run.runtime.store.folder)["passed"]  # 少于五局必须如实未通过。
 
 
@@ -546,10 +553,7 @@ def test_current_version_preserves_version_three_and_never_persists_authorizatio
     store.save()
     assert (tmp_path / "settings.v3.bak.json").read_text(encoding="utf8") == original
     data = json.loads(store.settings_path.read_text(encoding="utf8"))
-    assert data["version"] == 6 and data["profile"]["continuous_settings"] == {
-        "max_games": 5,
-        "time_limit": 1800,
-    }
+    assert data["version"] == 7 and data["profile"]["continuous_settings"] == {"max_games": 5}
     assert not any(k in data["profile"] for k in ("auto", "armed", "run_id", "running"))
 
 

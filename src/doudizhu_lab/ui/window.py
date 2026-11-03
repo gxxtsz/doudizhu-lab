@@ -747,7 +747,6 @@ class MainWindow(QMainWindow):
             completed=progress.completed if progress else 0,
             total=total,
             elapsed=elapsed,
-            time_limit=progress.time_limit if progress else settings["time_limit"],
             notice=notice,
             role=role,
             actor=actor,
@@ -757,7 +756,10 @@ class MainWindow(QMainWindow):
         )
 
     def render_dashboard(self) -> None:
-        """仅在 GUI 线程把只读快照映射到控件；渲染不创建任务，也不授予设备输入。"""
+        """在 GUI 线程展示准确局数与已用时间，进度条只接收0～10000的整数比例。
+
+        目标局数不交给 Qt 的固定宽度整数接口；渲染不创建任务，也不授予设备输入。
+        """
         state = self.dashboard_state()
         self.connection_label.setText(state.device_text)
         self.connection_label.setToolTip(state.device_text)
@@ -806,9 +808,10 @@ class MainWindow(QMainWindow):
         self.saved_replay_button.setVisible(state.saved)
         self.replay_button.setEnabled(not self.settings_locked and not self._exit_requested)
         self.games_label.setText(f"{state.completed} / {state.total} 局")
-        self.progress_bar.setRange(0, state.total)
-        self.progress_bar.setValue(state.completed)
-        self.elapsed_label.setText(f"{duration_text(state.elapsed)} / {duration_text(state.time_limit)}")
+        self.games_label.setToolTip(self.games_label.text())
+        # Qt 仅接收固定范围的进度；Python 整数计算比例，大局数不溢出，也不转成浮点数。
+        self.progress_bar.setValue(max(0, min(10_000, state.completed * 10_000 // state.total)))
+        self.elapsed_label.setText(f"已用时 {duration_text(state.elapsed)}")
         profile = self.store.profile
         policy = {"strict": "严格", "infer": "唯一推断", "balanced": "平衡"}[profile.continuous_policy]
         bidding = "模型叫抢" if profile.bid_settings["mode"] == "model" else "不叫不抢"

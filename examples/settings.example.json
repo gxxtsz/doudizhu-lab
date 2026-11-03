@@ -1,9 +1,10 @@
 {
-  "version": 6,
+  "version": 7,
   "profile": {
     "name": "示例牌桌 · 2400×1080",
     "play_model": "resnet",
     "flow_room": "当前",
+    "continuous_settings": {"max_games": 5},
     "base_width": 2400,
     "base_height": 1080
   }

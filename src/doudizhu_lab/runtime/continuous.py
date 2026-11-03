@@ -16,8 +16,9 @@ from doudizhu_lab.vision.flow import SCENE_NAMES
 
 @dataclass(frozen=True)
 class ContinuousProgress:
-    """任务界面的只读进度；时间单位为秒，completed 只统计已确认完成的牌局。
+    """任务界面的只读进度；elapsed 为已运行秒数，不代表任务截止时间。
 
+    completed 只统计已确认完成的牌局，total 为无业务上限的 Python 正整数。
     startup_phase为waiting_lobby时仅等待首次大厅并可返回大厅，为ready后才授权
     新局流程；默认ready兼容旧调用。等待仍属于running，GUI保留停止按钮。
     """
@@ -28,7 +29,6 @@ class ContinuousProgress:
     completed: int
     total: int
     elapsed: float
-    time_limit: int
     startup_phase: str = "ready"
 
 
@@ -70,16 +70,17 @@ class ContinuousRuntime:
         self.bid_agent, self.bidding = bid_agent, None
         self.bid_decision, self.bid_description = None, ""
         self._stop_intent = None
-        self._progress_cache = ContinuousProgress(
-            "idle", "unknown", "", 0, self.settings["max_games"], 0, self.settings["time_limit"]
-        )
+        self._progress_cache = ContinuousProgress("idle", "unknown", "", 0, self.settings["max_games"], 0)
 
     @property
     def active(self):
         return self.status == "running" and not self.stop_event.is_set()
 
     def progress(self) -> ContinuousProgress:
-        """返回只读进度；设备操作持锁时返回上次快照，不让 GUI 等待 USB 或账本写入。"""
+        """返回只读局数与已用秒数，不发布任务时限；目标局数保持 Python 整数精度。
+
+        设备操作持锁时返回上次快照，不让 GUI 等待 USB 或账本写入，不改变执行授权。
+        """
         if not self.lock.acquire(blocking=False):
             return self._progress_cache
         try:
@@ -90,7 +91,6 @@ class ContinuousRuntime:
                 len(self.completed),
                 self.settings["max_games"],
                 max(0, self.clock() - self.started),
-                self.settings["time_limit"],
                 self.startup_phase,
             )
             return self._progress_cache
@@ -284,11 +284,9 @@ class ContinuousRuntime:
         self.store.add("finished", reason=reason, at=self.clock())
         self.stop_event.set()
 
-    def _limited(self):
-        return (
-            len(self.completed) >= self.settings["max_games"]
-            or self.clock() - self.started >= self.settings["time_limit"]
-        )
+    def _limited(self) -> bool:
+        """只按已确认完成的局数判断任务目标，不限制总用时或等待大厅的时长。"""
+        return len(self.completed) >= self.settings["max_games"]
 
     def _wait_for_lobby(self, flow) -> bool:
         """处理本任务首次大厅确认前的只读等待；True表示本帧已消费，不进入单局授权。
@@ -299,9 +297,6 @@ class ContinuousRuntime:
         """
         if self.startup_phase != "waiting_lobby":
             return False
-        if self._limited():
-            self._complete("等待大厅期间已达到任务时间上限")
-            return True
         if flow.scene in ("lobby", "room"):
             button = next((b for b in flow.buttons if b.kind == "match" and b.enabled), None)
             self.reason = "正在确认大厅入口" if button else "等待可确认的大厅匹配入口"
@@ -349,9 +344,6 @@ class ContinuousRuntime:
             if not self.active:
                 return
             now = self.clock()
-            if self.startup_phase == "waiting_lobby" and self._limited():
-                self._complete("等待大厅期间已达到任务时间上限")
-                return
             if not self.bot.ready.is_set():
                 if self.bot.thread and not self.bot.thread.is_alive():
                     self.pause(self.bot.status)
@@ -538,14 +530,14 @@ class ContinuousRuntime:
                     return
             if flow.scene in ("lobby", "room"):
                 if self._limited():
-                    self._complete("已达到局数或时间上限，不再匹配")
+                    self._complete("已完成目标局数，不再匹配")
                     return
                 if not any(button.kind == "match" and button.enabled for button in flow.buttons):
                     self.candidate = None
                     return
                 self.lobby_confirmed = True
             if flow.scene in ("settlement", "showcase", "ending") and self._limited():
-                self._complete("当前局结束，已达到局数或时间上限")
+                self._complete("当前局结束，已完成目标局数")
                 return
             preferences = {
                 "lobby": ("match",),

@@ -28,9 +28,9 @@ def test_flow_room_legacy_values_are_normalized_to_current(tmp_path, room):
     store.save()
     restored = Store(tmp_path)
     assert restored.profile.flow_room == store.profile.flow_room == "当前"
-    assert restored.profile.continuous_settings == {"max_games": 5, "time_limit": 1800}
+    assert restored.profile.continuous_settings == {"max_games": 5}
     assert restored.profile.bid_settings["mode"] == "disabled"
-    assert json.loads(store.settings_path.read_text(encoding="utf8"))["version"] == 6
+    assert json.loads(store.settings_path.read_text(encoding="utf8"))["version"] == 7
 
 
 def test_flow_room_no_longer_rejects_unknown_room_name(tmp_path):
@@ -46,6 +46,7 @@ def test_v5_config_upgrade_backs_up_original_once_and_preserves_preferences(tmp_
     profile = asdict(store.profile)
     profile.update(flow_room=room, play_model="wp", threshold=0.91, continuous_policy="balanced")
     profile["bid_settings"]["mode"] = "model"
+    profile["continuous_settings"]["time_limit"] = 1800
     original = json.dumps({"version": 5, "profile": profile}, ensure_ascii=False)
     store.settings_path.write_text(original, encoding="utf8")
     loaded = Store(tmp_path)
@@ -53,11 +54,11 @@ def test_v5_config_upgrade_backs_up_original_once_and_preserves_preferences(tmp_
     assert loaded.settings_path.read_text(encoding="utf8") == original
     assert not (tmp_path / "settings.v5.bak.json").exists()
     loaded.save()
-    assert loaded.settings_version == 6
+    assert loaded.settings_version == 7
     backup = tmp_path / "settings.v5.bak.json"
     assert backup.read_text(encoding="utf8") == original
     saved = json.loads(loaded.settings_path.read_text(encoding="utf8"))
-    assert saved["profile"] == profile | {"flow_room": "当前"}
+    assert saved["profile"] == profile | {"flow_room": "当前", "continuous_settings": {"max_games": 5}}
     loaded.profile.continuous_settings["max_games"] = 7
     loaded.save()
     assert backup.read_text(encoding="utf8") == original

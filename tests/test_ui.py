@@ -8,7 +8,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QPoint, Qt, QTime
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QDialogButtonBox, QLabel, QPushButton
 
 from doudizhu_lab.domain.models import Device
@@ -62,7 +62,7 @@ class FakeContinuous:
         self.closed = 0
 
     def progress(self):
-        return ContinuousProgress(self.status, "lobby", self.reason, self.completed, 5, 12, 1800)
+        return ContinuousProgress(self.status, "lobby", self.reason, self.completed, 5, 12)
 
     def start(self):
         self.status = "running"
@@ -310,7 +310,6 @@ def test_waiting_lobby_notice_keeps_stop_available(window, backend, qtbot):
         0,
         5,
         10,
-        1800,
         "waiting_lobby",
     )
     window.render_dashboard()
@@ -357,27 +356,52 @@ def test_automatic_finish_saves_and_resumes_readonly_preview(window, backend, qt
 
 
 @pytest.mark.gui
-def test_settings_roundtrip_preserves_calibration_and_seconds(window, qtbot):
+@pytest.mark.parametrize("games", [7, 31, 2**31, 2**64, 10**100])
+def test_settings_roundtrip_preserves_calibration_and_unbounded_game_count(window, qtbot, games):
     before = deepcopy(window.store.profile.bot_controls)
     dialog = SettingsDialog(window)
     qtbot.addWidget(dialog)
     dialog.show()
     assert not hasattr(dialog, "room")
+    assert not hasattr(dialog, "time_limit")
+    assert not any("最长时间" in item.text() for item in dialog.findChildren(QLabel))
     assert any("沿用当前页面" in item.text() for item in dialog.findChildren(QLabel))
     window.render_dashboard()
     assert window.policy_label.text().startswith("沿用当前页面 · ")
     dialog.policy.setCurrentIndex(dialog.policy.findData("balanced"))
     dialog.bidding.setCurrentIndex(dialog.bidding.findData("model"))
-    dialog.games.setValue(7)
-    dialog.time_limit.setTime(QTime(0, 12, 34))
+    dialog.games.setText(str(games))
     dialog.save()
     saved = Store(window.store.root)
-    assert saved.settings_version == 6 and saved.profile.bot_controls == before
-    assert saved.profile.flow_room == "当前" and saved.profile.continuous_settings == {
-        "max_games": 7,
-        "time_limit": 754,
-    }
+    assert saved.settings_version == 7 and saved.profile.bot_controls == before
+    assert saved.profile.flow_room == "当前" and saved.profile.continuous_settings == {"max_games": games}
     assert saved.profile.continuous_policy == "balanced" and saved.profile.bid_settings["mode"] == "model"
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("text", ["", " ", "0", "-1", "+2", "1.5", "abc", "1_000", "1e3"])
+def test_invalid_game_count_stays_in_settings_and_preserves_configuration(window, qtbot, text):
+    original = deepcopy(window.store.profile)
+    dialog = SettingsDialog(window)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    dialog.games.setText(text)
+    dialog.save()
+    assert dialog.isVisible() and "大于0的整数" in dialog.error.text()
+    assert window.store.profile == original and not window.store.settings_path.exists()
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("total", [31, 2**31, 2**64, 10**100])
+@pytest.mark.parametrize("portion", [0, 1, 2])
+def test_dashboard_scales_large_targets_without_integer_overflow(window, total, portion):
+    completed = total * portion // 2
+    window._last_progress = ContinuousProgress("stopped", "lobby", "", completed, total, 100_000)
+    window.render_dashboard()
+    assert window.games_label.text() == f"{completed} / {total} 局"
+    assert window.progress_bar.minimum() == 0 and window.progress_bar.maximum() == 10_000
+    assert window.progress_bar.value() == completed * 10_000 // total
+    assert window.elapsed_label.text() == "已用时 27:46:40"
 
 
 @pytest.mark.gui
@@ -403,7 +427,7 @@ def test_failed_settings_save_rolls_back_memory(window, monkeypatch, qtbot):
     monkeypatch.setattr(window.store, "save", Mock(side_effect=OSError("磁盘不可写")))
     dialog = SettingsDialog(window)
     qtbot.addWidget(dialog)
-    dialog.games.setValue(20)
+    dialog.games.setText("20")
     dialog.save()
     assert window.store.profile is original and "磁盘不可写" in dialog.error.text()
 

@@ -44,10 +44,16 @@ class Store:
     """管理用户配置，损坏配置不静默覆盖；调用者收到错误后可以选择重置。
 
     读取旧配置只在内存中补齐默认值，并将已弃用的 flow_room 归为“当前”；不在
-    构造时回写文件。play_model、叫抢、任务上限及既有标定仍按原配置保留。
+    构造时回写文件。第七版起在内存中移除旧 time_limit，保留原目标局数；
+    play_model、叫抢及既有标定仍按原配置保留，首次保存前备份原版本文件。
     """
 
     def __init__(self, root: Path | None = None):
+        """从指定数据目录加载配置；root 为 None 时沿用项目的数据目录解析规则。
+
+        创建所需的根目录和模板目录，但不自动回写配置。旧版总时长仅在内存移除，
+        原目标局数、模型和标定保留；损坏或不合法的配置以中文 ValueError 报告。
+        """
         self.root = resolve_data_dir(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.template_dir = self.root / "templates"
@@ -64,6 +70,10 @@ class Store:
                 p = raw.get("profile", {})
                 self._bidding_upgrade = "bid_settings" not in p
                 self.settings_version = int(raw.get("version", 1))
+                continuous = p.get("continuous_settings", self.profile.continuous_settings)
+                if self.settings_version < 7 and isinstance(continuous, dict):
+                    # 只迁移已取消的总时长字段；其他未知字段仍由配置契约拒绝。
+                    continuous = {key: value for key, value in continuous.items() if key != "time_limit"}
                 regions = {k: NormalizedRect(**v) for k, v in p.get("regions", {}).items()}
                 if self.settings_version == 1 and regions:
                     regions.setdefault("self_play", default_regions()["self_play"])
@@ -80,7 +90,7 @@ class Store:
                     margin=float(p.get("margin", 0.055)),
                     hand_classifier=p.get("hand_classifier", "template"),
                     play_model=p.get("play_model", "resnet"),
-                    continuous_settings=p.get("continuous_settings", self.profile.continuous_settings),
+                    continuous_settings=continuous,
                     flow_room="当前",
                     continuous_policy=p.get("continuous_policy", "strict"),
                     bid_settings=p.get("bid_settings", default_bid_settings()),

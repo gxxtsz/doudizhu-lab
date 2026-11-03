@@ -10,9 +10,17 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from doudizhu_lab import __version__
 from doudizhu_lab.cli.console import configure_console
-from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES
+from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES, parse_max_games
 from doudizhu_lab.storage.config import Store
 from doudizhu_lab.ui.window import MainWindow
+
+
+def _positive_games(text: str) -> int:
+    """按共享局数规则解析命令行；无业务上限，无效输入由 argparse 显示中文原因。"""
+    try:
+        return parse_max_games(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def main() -> None:
@@ -20,7 +28,9 @@ def main() -> None:
 
     --data-dir 用于隔离测试数据，--preview 显式只读预览；默认也会预览唯一授权手机。
     窗口显示后自动后台加载所选本地模型，不隐式下载；--flow-room 仅兼容旧脚本，
-    参数值不再限制场次。程序始终沿用当前页面，加载本身不启动匹配或授予输入。
+    参数值不再限制场次；旧 --time-limit 仅接收并提示弃用，不影响任务结束条件。
+    --max-games 接受任意正整数，默认五局，不设任务总时长。程序始终沿用当前页面，
+    加载本身不启动匹配或授予输入。
     只有用户显式启动连续游戏后，窗口才准备录像并申请输入；参数错误由
     argparse 以 SystemExit 拒绝，配置加载错误通过中文对话框说明后退出。
     """
@@ -44,7 +54,7 @@ def main() -> None:
         help="兼容旧脚本，参数值不再限制场次；始终沿用当前页面",
     )
     parser.add_argument(
-        "--continuous", action="store_true", help="显式启动连续游戏，默认5局或30分钟；需要vision依赖"
+        "--continuous", action="store_true", help="显式启动连续游戏，默认5局，不限制总时长；需要vision依赖"
     )
     parser.add_argument(
         "--continuous-policy",
@@ -55,14 +65,12 @@ def main() -> None:
         "--bidding", choices=("disabled", "model"), help="叫抢策略：固定拒绝或现成模型自动叫抢；始终不加倍"
     )
     parser.add_argument(
-        "--max-games", type=int, choices=range(1, 31), help="本次连续任务上限1～30局，不保存自动授权"
+        "--max-games", type=_positive_games, help="本次连续任务目标局数，正整数且不设上限；不保存自动授权"
     )
     parser.add_argument(
         "--time-limit",
-        type=int,
-        choices=range(1, 14401),
         metavar="秒",
-        help="本次任务时长上限，最长4小时；到时打完当前局停止",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--acceptance", action="store_true", help="以已冻结版本记录独立验收批次，需配合 --record"
@@ -70,6 +78,8 @@ def main() -> None:
     parser.add_argument("--quit-after", type=int, help="指定秒数后退出并保存运行统计，用于稳定性验证")
     parser.add_argument("--version", action="version", version=f"斗地主实验室 {__version__}")
     args = parser.parse_args()
+    if args.time_limit is not None:
+        print("提示：--time-limit 已弃用并忽略，连续任务仅按设定局数结束。", file=sys.stderr)
     app = QApplication(sys.argv[:1])
     app.setFont(QFont("Microsoft YaHei UI", 10))
     try:
@@ -82,10 +92,8 @@ def main() -> None:
             store.profile.continuous_policy = args.continuous_policy
         if args.bidding:
             store.profile.bid_settings["mode"] = args.bidding
-        if args.max_games:
+        if args.max_games is not None:
             store.profile.continuous_settings["max_games"] = args.max_games
-        if args.time_limit:
-            store.profile.continuous_settings["time_limit"] = args.time_limit
         startup_action = (
             "continuous"
             if args.continuous

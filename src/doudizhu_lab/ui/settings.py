@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QTime, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -16,12 +16,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QPushButton,
-    QSpinBox,
-    QTimeEdit,
     QVBoxLayout,
 )
 
-from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES
+from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES, parse_max_games
 from doudizhu_lab.ui.components import label
 from doudizhu_lab.ui.theme import STYLE
 
@@ -86,17 +84,12 @@ class SettingsDialog(QDialog):
         self.bidding.addItem("模型自动叫抢", "model")
         self.bidding.setCurrentIndex(self.bidding.findData(profile.bid_settings["mode"]))
         form.addRow("叫抢策略", self.bidding)
-        self.games = QSpinBox()
-        self.games.setRange(1, 30)
-        self.games.setSuffix(" 局")
-        self.games.setValue(profile.continuous_settings["max_games"])
+        # 使用文本和 Python 整数，避免 QSpinBox/QIntValidator 的固定宽度整数上限。
+        self.games = QLineEdit(str(profile.continuous_settings["max_games"]))
+        self.games.setPlaceholderText("请输入大于0的整数")
+        self.games.setToolTip("达到设定局数后停止，局数不设上限")
         form.addRow("最多局数", self.games)
-        self.time_limit = QTimeEdit()
-        self.time_limit.setDisplayFormat("HH:mm:ss")
-        self.time_limit.setTimeRange(QTime(0, 0, 1), QTime(4, 0, 0))
-        self.time_limit.setTime(QTime(0, 0).addSecs(profile.continuous_settings["time_limit"]))
-        form.addRow("最长时间", self.time_limit)
-        form.addRow(label("到达时限后打完当前局停止；叫抢始终不加倍。", "muted", wrap=True))
+        form.addRow(label("按设定局数完成后停止，不限制总时长；叫抢始终不加倍。", "muted", wrap=True))
         layout.addWidget(self.task)
         self.error = label("", "notice", wrap=True)
         self.error.hide()
@@ -144,16 +137,16 @@ class SettingsDialog(QDialog):
             self.adb_path.setText(path)
 
     def save(self) -> None:
-        """校验并发布表单副本；保存失败直接显示中文原因，已有配置与标定保持原值。"""
+        """按正整数校验目标局数并发布表单副本；不设局数或任务总时长上限。
+
+        文本解析或保存失败直接显示中文原因，已有配置与标定保持原值，不授予执行权限。
+        """
         profile = deepcopy(self.window.store.profile)
         profile.play_model = self.play_model.currentData()
         profile.continuous_policy = self.policy.currentData()
         profile.bid_settings["mode"] = self.bidding.currentData()
-        profile.continuous_settings = {
-            "max_games": self.games.value(),
-            "time_limit": QTime(0, 0).secsTo(self.time_limit.time()),
-        }
         try:
+            profile.continuous_settings = {"max_games": parse_max_games(self.games.text())}
             self.window.apply_settings(profile, self.adb_path.text().strip(), self.devices.currentData())
         except (OSError, ValueError) as exc:
             self.error.setText(str(exc))

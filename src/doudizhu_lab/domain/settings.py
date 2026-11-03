@@ -9,7 +9,25 @@ from doudizhu_lab.domain.models import NormalizedRect, TrackerSettings
 # 仅保留旧场次名称供历史调用兼容；不再参与配置校验、页面识别或输入授权。
 FLOW_ROOMS: tuple[str, ...] = ("初级", "中级", "高级")
 PLAY_MODEL_NAMES = {"resnet": "ResNet", "wp": "WP"}
-CONFIGURATION_VERSION = 6
+CONFIGURATION_VERSION = 7
+
+
+def parse_max_games(text: str) -> int:
+    """将局数文本解析为 Python 正整数；无有效局数时抛出中文 ValueError。
+
+    接受首尾空白和十进制数字，不接受正负号、小数、空文本或零。此接口供设置
+    表单和命令行共用，不设业务上限，也不经过 Qt 或固定宽度整数转换，不修改配置。
+    """
+    value = text.strip()
+    if not value or not value.isascii() or not value.isdecimal():
+        raise ValueError("最多局数必须为大于0的整数")
+    try:
+        games = int(value)
+    except ValueError as exc:
+        raise ValueError("最多局数不是有效的正整数") from exc
+    if games <= 0:
+        raise ValueError("最多局数必须为大于0的整数")
+    return games
 
 
 def default_bid_settings() -> dict[str, str | float]:
@@ -49,8 +67,8 @@ class Profile:
     hand_classifier: str = "template"
     # 只保存出牌模型偏好；旧配置缺少此字段时升级为 ResNet，不恢复任何执行授权。
     play_model: str = "resnet"
-    # 仅保存策略和上限；运行授权、当前模式与未完成任务不得跨重启恢复。
-    continuous_settings: dict = field(default_factory=lambda: {"max_games": 5, "time_limit": 1800})
+    # 只保存目标局数，不设局数或总时长上限；运行授权与未完成任务不得跨重启恢复。
+    continuous_settings: dict[str, int] = field(default_factory=lambda: {"max_games": 5})
     # 已弃用的兼容字段；读取和保存均归为“当前”，实际运行始终沿用当前页面。
     flow_room: str = "当前"
     # 策略偏好可以保存，实际连续执行授权仍不保存；旧配置保持严格模式。
@@ -107,6 +125,7 @@ def validate_bot_profile(profile: Profile) -> None:
 
     profile 可保持未完成的操作标定，但不能含负数、非有限值或放宽后的超时。
     flow_room 为已弃用的兼容字段，不作为玩法、场次或输入授权的校验条件。
+    连续任务仅接受一个 max_games 正整数字段，不设局数上限；bool 不作为整数接受。
     本函数不修改配置、不访问设备，可在加载配置或 GUI 保存前调用，不授予输入权限。
     """
     if profile.hand_classifier not in ("template", "pretrained-ocr"):
@@ -126,11 +145,13 @@ def validate_bot_profile(profile: Profile) -> None:
         raise ValueError("稳健叫抢策略要求首叫阈值不高于抢地主及回抢阈值")
     if profile.continuous_policy not in ("strict", "infer", "balanced"):
         raise ValueError("连续策略必须为严格、唯一推断或平衡模式")
-    if set(settings) != {"max_games", "time_limit"} or any(
-        type(settings[k]) is not int or not 0 < settings[k] <= limit
-        for k, limit in (("max_games", 30), ("time_limit", 14400))
+    if (
+        not isinstance(settings, dict)
+        or set(settings) != {"max_games"}
+        or type(settings["max_games"]) is not int
+        or settings["max_games"] <= 0
     ):
-        raise ValueError("连续任务上限必须为1～30局、1～14400秒；默认仍为5局或30分钟")
+        raise ValueError("连续任务最多局数必须为大于0的整数，且只设置max_games")
     config = profile.bot_controls
     for name in ("normal_top", "selected_offset", "top_tolerance", "glyph_top_padding"):
         value = config.get(name)

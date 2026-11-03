@@ -14,6 +14,7 @@ class DashboardState:
     """GUI 线程的一次只读展示快照，不通过显示文本反推任务或模型状态。
 
     status 是界面生命周期，model_state 是模型生命周期；两者相互独立。
+    局数为 Python 整数，不设业务上限；elapsed 只显示已用秒数，不设任务截止时间。
     局数和用时来自任务快照，未知局面显示占位，不猜测牌点或剩牌数。
     """
 
@@ -26,7 +27,6 @@ class DashboardState:
     completed: int = 0
     total: int = 5
     elapsed: float = 0
-    time_limit: int = 1800
     notice: str = "模型就绪并连接手机后，即可开始连续游戏。"
     role: str = "—"
     actor: str = "—"

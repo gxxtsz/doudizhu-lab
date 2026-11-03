@@ -27,7 +27,7 @@
 
 模型通过`ModelStatus`发布加载生命周期，连续任务通过`ContinuousProgress`发布只读进度，窗口汇总为`DashboardState`绘制面板，不解析拼接文案。流程持有设备锁时，界面读取缓存进度，不阻塞GUI心跳。
 
-`FlowRecognizer.observe(room=...)`保留旧参数但忽略场次限制；大厅只由通过文字、位置和底色校验的“开始匹配”按钮确认。`FlowObservation.mode_verified`仅兼容旧调用和记录，不参与运行判断。连续协调器以仅存于本任务的`lobby_confirmed`记录有效大厅入口，仍要求从大厅建立完整开局；两帧稳定、单次提交和提交后证据确认保持原逻辑。明确切场提示与普通确认按钮可自动继续，付费或健康提示仍阻断。`Profile.flow_room`读取和保存统一为“当前”，第六版配置首次保存保留旧版备份。
+`FlowRecognizer.observe(room=...)`保留旧参数但忽略场次限制；大厅只由通过文字、位置和底色校验的“开始匹配”按钮确认。`FlowObservation.mode_verified`仅兼容旧调用和记录，不参与运行判断。连续协调器以仅存于本任务的`lobby_confirmed`记录有效大厅入口，仍要求从大厅建立完整开局；两帧稳定、单次提交和提交后证据确认保持原逻辑。明确切场提示与普通确认按钮可自动继续，付费或健康提示仍阻断。`Profile.flow_room`读取和保存统一为“当前”。当前第七版配置仅以无业务上限的正整数`max_games`管理任务正常结束，不保存`time_limit`；`ContinuousProgress`与`DashboardState`只发布已用秒数，进度条使用固定范围的整数比例。旧配置首次保存保留原版本备份。
 
 `create_agent(root, backend="resnet")`按明确偏好创建代理，`Profile.play_model`保存选择；旧`Agent(folder)`仍默认为WP。ResNet编码及网络独立保存，界面进程不导入PyTorch。`ModelStatus`和`DashboardState`包含模型后端、显示名称和权重编号；`Decision.strategy`区分`resnet`、`wp`、`rules`，两种模型执行前均经过完整公开局面校验。切换由协调线程串行关闭旧代理、预热新代理，界面立即清除旧建议，迟到结果不得发布。
 
