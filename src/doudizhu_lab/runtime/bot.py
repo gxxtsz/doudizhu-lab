@@ -111,6 +111,7 @@ class BotRuntime:
         self.agent = agent or create_agent(root, play_model)
         self._requested_model = None
         self.clock, self.threaded, self.owns_agent = clock, threaded, agent is None
+        self.pulse_lock = threading.RLock()
         self.pipeline = None
         self.mode = "suggest"
         self.status = "模型未加载"
@@ -210,14 +211,22 @@ class BotRuntime:
             self._journal_session = None
 
     def attach(self, pipeline):
-        """切换会话只保留模型，立即撤销旧输入；自动模式不能跨会话恢复。"""
-        with self.lock:
+        """切换会话只保留模型，立即撤销旧输入；自动模式不能跨会话恢复。
+
+        与后台pulse串行，等待旧会话最后一次审计写入退出后关闭专用SQLite连接，
+        再清空会话引用。传入None用于停止收尾，返回后旧动作不能继续写入已交给清理的目录。
+        """
+        with self.pulse_lock, self.lock:
             if pipeline is self.pipeline:
                 return
             self.set_mode("suggest")
             self.pipeline = pipeline
             self._game = self._decision_version = ""
             self._journal_session = None
+            self._action_pipeline = None
+            if self._audit_session:
+                self._audit_session.close()
+                self._audit_session = None
 
     def set_mode(self, mode):
         """模式为 suggest/step/auto/stop；每次切换都使旧决策执行授权失效。"""
@@ -292,16 +301,23 @@ class BotRuntime:
                 and (raw.width, raw.height) == (snapshot.frame.width, snapshot.frame.height)
             )
 
-        self.gate.tap(
-            "bot",
-            token,
-            getattr(pipeline, "control_client", pipeline.client),
-            x,
-            y,
-            snapshot.frame,
-            guard=valid,
-            cancelled=self.stop_event.is_set,
-        )
+        from doudizhu_lab.devices.adb import InputRejected
+
+        try:
+            self.gate.tap(
+                "bot",
+                token,
+                getattr(pipeline, "control_client", pipeline.client),
+                x,
+                y,
+                snapshot.frame,
+                guard=valid,
+                cancelled=self.stop_event.is_set,
+            )
+        except InputRejected:
+            if operating and kind in ("play", "pass"):
+                operating.reject_submission(self.executor.decision)
+            raise
 
     def _run(self):
         try:
@@ -349,6 +365,11 @@ class BotRuntime:
 
     def pulse(self):
         """处理一轮最新观察；生产线程与确定性模拟共用，不在模拟中复制决策执行逻辑。"""
+        with self.pulse_lock:
+            self._pulse()
+
+    def _pulse(self):
+        """在单轮锁内推进；后台detach等待本轮完成后关闭动作账本，避免数据库遗留句柄。"""
         check_running = getattr(self.agent, "check_running", None)
         if check_running:
             check_running()

@@ -1,21 +1,23 @@
-"""平衡运行状态：与严格原始事件分开保存的唯一推断和规则接管。"""
+"""与原始事件分开保存的确定性运行状态；各模式共用证明，平衡模式另支持规则接管。"""
 
 from collections import Counter
+from copy import deepcopy
 from dataclasses import asdict, replace
 from hashlib import sha256
 from threading import RLock
 
 from doudizhu_lab.agents.rules import RuleRound, role_for
 from doudizhu_lab.domain.bot_types import SnapshotSequence, encode
+from doudizhu_lab.domain.inference import deductions, frame_context, make_proof, matches, verify_proof
 from doudizhu_lab.domain.table import TableObservation
-from doudizhu_lab.domain.tracker import GameTracker
+from doudizhu_lab.domain.tracker import GameTracker, apply_event
 
 
 class OperationalObserver:
     """第二套公开状态，不覆盖严格观察或严格事件。
 
-    infer只接受计数守恒与明确行动者形成的唯一不出推断；balanced另外允许在没有在途
-    提交、没有采集中断且当前回合可重新确认时采用局部规则。每局重新尝试完整WP状态。
+    strict、infer、balanced共用可独立复核的第二版确定性证明。balanced另外允许在
+    没有在途提交、没有采集中断且当前回合可重新确认时采用局部规则；新局重新建立完整模型状态。
     """
 
     def __init__(self, profile):
@@ -29,7 +31,87 @@ class OperationalObserver:
         self.lead_signature = profile.bot_controls.get("lead_signature")
         self.inference_probe, self.inferred = None, {}
         self.last_frame = ""
+        self.anchors, self.deal_anchors = [], []
+        self.raw_anchors, self.raw_deal_anchors = [], []
+        self.pending_proofs = {}
+        self.round_context = None
         self.lock = RLock()
+
+    def reject_submission(self, decision):
+        """只在底层明确保证未发送时撤销占位；命令超时或结果未知不能调用。
+
+        同时清理规则视图的在途意图，避免一次被拒绝的点击阻止后续新帧重新核对。
+        """
+        with self.lock:
+            if self.open_submission == decision:
+                self.open_submission = self.submission_pts = None
+                if self.rule:
+                    self.rule.intent = self.rule.expected_hand = None
+
+    @staticmethod
+    def _anchor_pair(buffer, raw):
+        """保留短期原始帧并选取相隔至少100毫秒的最近双帧。
+
+        高帧率下相邻两帧可能仅相隔几十毫秒，不能一直只检查相邻帧；当前帧始终是
+        后锚点，绝不将旧双帧的结果套到更新的画面。设备、视频流、分局或时间倒退时清空。
+        """
+        if buffer and (
+            raw["pts_us"] <= buffer[-1]["pts_us"]
+            or raw.get("frame_context") != buffer[-1].get("frame_context")
+        ):
+            buffer.clear()
+        buffer.append(raw)
+        buffer[:] = [o for o in buffer[-512:] if raw["pts_us"] - o["pts_us"] <= 8_000_000]
+        previous = next((o for o in reversed(buffer[:-1]) if raw["pts_us"] - o["pts_us"] >= 100_000), None)
+        return [previous, raw] if previous is not None else [raw]
+
+    def _augment(self, obs):
+        """只补充已求出唯一答案的运行视图；原始锚点先复制保存，绝不回写截图观察。"""
+        raw = asdict(obs)
+        self.anchors = self._anchor_pair(self.raw_anchors, raw)
+        if obs.phase in ("dealing", "bidding") and len(obs.hand or []) == 17:
+            self.deal_anchors = self._anchor_pair(self.raw_deal_anchors, raw)
+        if self.round_context is not None and obs.frame_context != self.round_context:
+            return  # 仍让直接观察器识别新局，但不跨原始分局边界拼接证明。
+        for claim in deductions(self.tracker.state, self.anchors, deal_values=self.deal_anchors):
+            kind, seat = claim["kind"], claim.get("seat")
+            if kind == "setup":
+                for key, value in claim["data"].items():
+                    if key != "initial_hand":
+                        setattr(obs, key, value)
+            elif kind == "play":
+                weak = [c for c in self.tracker._candidates if c["seat"] == seat]
+                if (
+                    weak
+                    and not any(c["ready"] for c in weak)
+                    and any(c["kind"] == "play" and c["after_count"] != obs.remaining[seat] for c in weak)
+                ):
+                    # 动画遮住手牌可能先产生错误的少牌候选。完整双帧已经唯一证明真实动作时，
+                    # 撤回仍未获牌面支持的弱候选，从可信前缀重建差分；不能覆盖任何已就绪证据。
+                    self.tracker._candidates = [c for c in self.tracker._candidates if c not in weak]
+                    self.tracker._counts[seat] = self.tracker.state.remaining[seat]
+                    if seat == "self":
+                        self.tracker._hand = deepcopy(self.tracker.state.hand)
+                    presence = self.tracker._presence.get(seat)
+                    if presence and presence.get("candidate") in weak:
+                        presence.update(candidate=None, consumed=True, consumed_turn=self.tracker.state.turn)
+                if obs.phase == "settlement" and obs.remaining.get(seat) == 0:
+                    # 结算已经覆盖最后出牌区时，先把已证明的末手交给合法动作检查。
+                    # 胜者标记仍保留，跟踪器确认末手后立即发出结束事件；原始阶段不变。
+                    obs.phase = "playing"
+                if all(
+                    Counter(o.get("plays", {}).get(seat) or []) == Counter(claim["cards"])
+                    for o in self.anchors
+                ):
+                    continue
+                obs.plays[seat] = list(claim["cards"])
+            elif kind == "pass":
+                if all(seat in o.get("passes", []) for o in self.anchors):
+                    continue
+                if seat not in obs.passes:
+                    obs.passes.append(seat)
+                obs.pass_labels[seat] = "pass"
+            self.pending_proofs[kind, seat] = (deepcopy(self.anchors), deepcopy(self.deal_anchors))
 
     def note_submission(self, decision, pts_us):
         """登记单次提交的在途意图；未知结果时禁止用策略切换绕开确认。"""
@@ -53,6 +135,7 @@ class OperationalObserver:
                 self.rule.confirmed(decision)
 
     def _infer_passes(self, obs):
+        """兼容旧开发用例的第一版不出视图；生产transform仅调用统一的_augment证明路径。"""
         state = self.tracker.state
         if state.pending or state.capture_incomplete or not state.last_play or not state.current_actor:
             self.inference_probe = None
@@ -138,15 +221,32 @@ class OperationalObserver:
             return self._transform(snapshot)
 
     def _transform(self, snapshot):
-        if self.policy == "strict" or snapshot.frame.frame_id == self.last_frame:
-            return snapshot if self.policy == "strict" else self.latest
+        if snapshot.frame.frame_id == self.last_frame:
+            return self.latest
         self.last_frame = snapshot.frame.frame_id
         obs = TableObservation(**snapshot.observation)
+        obs.frame_context = obs.frame_context or frame_context(snapshot.frame)
         if snapshot.state["capture_incomplete"]:
+            self.anchors, self.deal_anchors = [], []
+            self.raw_anchors, self.raw_deal_anchors = [], []
+            self.pending_proofs.clear()
             self.latest = snapshot
             return snapshot
-        self._infer_passes(obs)
-        update = self.tracker.observe(obs)
+        self._augment(obs)
+        deadline = self.submission_pts + 8_000_000 if self.submission_pts is not None else None
+        if (
+            obs.phase == "settlement"
+            and self.open_submission is not None
+            and deadline is not None
+            and obs.pts_us <= deadline
+            and self.tracker.state.phase == "playing"
+            and not any(v == 0 for v in self.tracker.state.remaining.values())
+        ):
+            # 已提交但结果未知时，结算页不能先把尚待核验的末手冲成缺口；只读等待
+            # 最多八秒。模型意图不补牌，缺少双帧零牌及末手证据仍不能确认或计为完成。
+            obs.phase = "playing"
+        before = deepcopy(self.tracker.state)
+        update = self.tracker.observe(obs, action_deadline_us=deadline)
         for event in update.events:
             if event.kind == "game_start":
                 self.history = []
@@ -154,14 +254,35 @@ class OperationalObserver:
                 self.inference_probe = None
                 self.open_submission = None
                 self.submission_pts = None
-            if event.kind == "pass" and event.seat in self.inferred:
-                event.source = "operational_inferred"
-                event.data["inference"] = self.inferred.pop(event.seat)
-            else:
-                event.source = "operational_observed"
+                raw = asdict(TableObservation(**snapshot.observation))
+                raw["frame_context"] = dict(obs.frame_context)
+                self.round_context = dict(obs.frame_context)
+                self.anchors = [raw]
+                self.raw_anchors = [raw]
+                self.deal_anchors = (
+                    [raw] if obs.phase in ("dealing", "bidding") and len(obs.hand or []) == 17 else []
+                )
+                self.raw_deal_anchors = deepcopy(self.deal_anchors)
+                self.pending_proofs.clear()
+            event.source = "operational_observed"
+            pending = self.pending_proofs.get((event.kind, event.seat))
+            if pending and event.confirmed:
+                values, deal = pending
+                for claim in deductions(before, values, deal_values=deal):
+                    if matches(asdict(event), claim):
+                        event.data["inference"] = make_proof(before, claim, values, deal_values=deal)
+                        raw_map = {o["frame_id"]: o for o in [*values, *deal]}
+                        if not verify_proof(
+                            asdict(event), before, raw_map, expected_context=self.round_context
+                        ):
+                            raise ValueError("运行时确定性证明无法独立复核")
+                        event.source = "operational_inferred"
+                        self.pending_proofs.pop((event.kind, event.seat), None)
+                        break
             if event.confirmed:
                 self.history.append(asdict(event))
             self.new_events.append(asdict(event))
+            before = apply_event(before, event)
         state = asdict(update.state)
         if self.rule and self.rule.state["game_id"] != state["game_id"]:
             self.rule = None

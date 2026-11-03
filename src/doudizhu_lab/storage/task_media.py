@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
+from time import monotonic
 
 from doudizhu_lab.storage.json_io import atomic_json
-from doudizhu_lab.storage.retention import checked_tree
+from doudizhu_lab.storage.retention import checked_media, checked_session, finalize_retention
 
 
 class TaskMediaRotator:
@@ -18,10 +19,11 @@ class TaskMediaRotator:
         self.sessions = {}
         self.removed = []
         self.request_rotation = request_rotation
+        self.cleanup_retry = {}
 
     def register(self, folder: Path, *, closed: bool = False) -> None:
         """登记本任务会话及写入者退出事实；路径必须位于 sessions 直接子目录且无链接。"""
-        folder = checked_tree(Path(folder), self.root / "sessions")
+        folder = checked_session(Path(folder), self.root / "sessions")
         self.sessions[folder] = closed or self.sessions.get(folder, False)
 
     def rotate(self) -> int:
@@ -31,21 +33,31 @@ class TaskMediaRotator:
         返回删除的文件数量，删除记录在任务目录永久保留，不能当作真实采集缺口。
         """
         registered = self.sessions.copy()
+        for folder, closed in registered.items():
+            if not closed or monotonic() < self.cleanup_retry.get(folder, 0):
+                continue
+            summary = self.root / "recording-summaries" / f"{folder.name}.json"
+            if (
+                summary.is_file()
+                and json.loads(summary.read_text(encoding="utf8")).get("media_status") == "cleanup_pending"
+            ):
+                self.cleanup_retry[folder] = monotonic() + 60
+                finalize_retention(folder, self.root)
         for record in self.removed:
             if record["status"] == "planned":
                 folder = next((p for p in registered if p.name == record["session"]), None)
                 if folder is None or not registered[folder]:
                     continue
-                checked_tree(folder, self.root / "sessions")
+                checked_session(folder, self.root / "sessions")
                 path = folder / record["file"]
                 if path.parent not in (folder / "video", folder / "evidence"):
                     raise ValueError("待重试轮转文件路径越界")
-                path.unlink(missing_ok=True)
+                checked_media(path, folder).unlink(missing_ok=True)
                 record["status"] = "removed"
                 atomic_json(self.folder / "媒体轮转记录.json", {"removed": self.removed})
         groups, total = [], 0
         for folder, closed in registered.items():
-            checked_tree(folder, self.root / "sessions")
+            checked_session(folder, self.root / "sessions")
             try:
                 ledger = json.loads((folder / "留存记录.json").read_text(encoding="utf8"))
                 segments = json.loads((folder / "video/index.json").read_text(encoding="utf8"))
@@ -112,7 +124,15 @@ class TaskMediaRotator:
                         path = folder / "evidence" / f"{name}.png"
                         if path.is_file() and item.get("status") in ("saved", "rebuilt", "rotation_planned"):
                             owned.append(path)
-                size = sum(p.stat().st_size for p in owned)
+                size = 0
+                present = []
+                for path in owned:
+                    try:
+                        size += checked_media(path, folder).stat().st_size
+                        present.append(path)
+                    except FileNotFoundError:
+                        continue
+                owned = present
                 if owned:
                     groups.append((folder, window, owned, size))
                     total += size
@@ -175,7 +195,7 @@ class TaskMediaRotator:
                 }
                 self.removed.append(record)
                 atomic_json(self.folder / "媒体轮转记录.json", {"removed": self.removed})
-                path.unlink(missing_ok=True)
+                checked_media(path, folder).unlink(missing_ok=True)
                 record["status"] = "removed"
                 removed += 1
             total -= size

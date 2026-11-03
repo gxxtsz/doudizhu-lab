@@ -30,6 +30,7 @@ def check_archive(path: Path) -> None:
         "_vendor/douzero_resnet/models.py",
         "agents/resnet_features.py",
         "agents/backends.py",
+        "domain/inference.py",
         "runtime/supervisor.py",
         "runtime/session_process.py",
         "runtime/process.py",

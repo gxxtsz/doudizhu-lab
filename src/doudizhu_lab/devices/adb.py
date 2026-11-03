@@ -41,6 +41,14 @@ class AdbError(RuntimeError):
 class InputRejected(AdbError):
     """输入在本地校验阶段被拒绝，ADB尚未调用；与发送后的超时或结果未知严格区分。"""
 
+    def __init__(self, message, *, code="input_rejected", **details):
+        """code为稳定本地拒绝原因；只有stale_frame允许重新取得证据后尝试未发送的输入。
+
+        保留AdbError原有诊断参数和旧的单消息构造方式；不把任何ADB执行异常包装成本类。
+        """
+        super().__init__(message, **details)
+        self.code = code
+
 
 class RawFormatError(ValueError):
     """像素格式不支持时可回退 PNG；长度错误、截断等数据损坏不属于此类。"""
@@ -197,11 +205,11 @@ class AdbClient:
         """
         with self._lock:
             if frame.transport not in ("raw", "png", "video"):
-                raise InputRejected("离线截图和回放画面禁止发送手机输入")
+                raise InputRejected("离线截图和回放画面禁止发送手机输入", code="offline_frame")
             if frame.serial != self.serial:
-                raise InputRejected("画面所属设备已变化，请重新获取画面")
+                raise InputRejected("画面所属设备已变化，请重新获取画面", code="device_changed")
             if frame.age > max_age:
-                raise InputRejected("画面已过期，请等待新截图后再点击")
+                raise InputRejected("画面已过期，请等待新截图后再点击", code="stale_frame")
             if (
                 isinstance(x, bool)
                 or isinstance(y, bool)
@@ -209,5 +217,5 @@ class AdbClient:
                 or not isinstance(y, int)
                 or not (0 <= x < frame.width and 0 <= y < frame.height)
             ):
-                raise InputRejected("点击坐标必须是原图范围内的整数像素")
+                raise InputRejected("点击坐标必须是原图范围内的整数像素", code="invalid_coordinates")
             self._run(["shell", "input", "tap", str(x), str(y)])

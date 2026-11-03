@@ -220,13 +220,13 @@ def test_pending_own_pass_can_use_unchanged_hand_counts_and_unique_actor(cards, 
         assert len(proof["frames"]) == 2 and proof["to_us"] - proof["from_us"] >= 100_000
 
 
-@pytest.mark.parametrize("cards", [None, ["8"]])
-def test_unknown_or_new_visible_cards_block_pass_inference(cards):
+@pytest.mark.parametrize("cards,expected", [(None, True), (["8"], False)])
+def test_unique_counts_allow_unknown_region_but_reject_new_visible_cards(cards, expected):
     observer, state = inference_observer()
     for ms in (1000, 1120, 1240):
         raw = snapshot(ms, state, actor="left", plays={"self": ["3"], "right": cards, "left": []})
         observer.transform(raw)
-    assert not any(e["source"] == "operational_inferred" for e in observer.history)
+    assert any(e["source"] == "operational_inferred" for e in observer.history) == expected
 
 
 def test_unknown_submission_and_capture_gap_cannot_activate_fallback():

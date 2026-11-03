@@ -73,6 +73,12 @@ class ObservationSnapshot:
     def create(cls, frame, recognition, observation, state, history, *, pending=False, allowed=False):
         """在分析结果产生的线程内一次构造；拒绝图像与语义观察的帧标识不一致。"""
         obs = asdict(observation) if is_dataclass(observation) else observation
+        from doudizhu_lab.domain.inference import frame_context
+
+        obs = dict(obs)
+        obs["frame_context"] = dict(obs.get("frame_context") or frame_context(frame))
+        raw_state = asdict(state) if is_dataclass(state) else state
+        obs["frame_context"].setdefault("round_id", raw_state.get("game_id", ""))
         if obs["frame_id"] != frame.frame_id or obs["pts_us"] != frame.media_pts_us:
             raise ValueError("机器人快照的观察与图像不是同一帧")
         if recognition is not None and recognition.frame_time != frame.captured_at:

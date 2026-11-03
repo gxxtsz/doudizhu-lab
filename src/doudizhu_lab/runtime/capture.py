@@ -354,6 +354,9 @@ class CaptureWorker:
                     self.ledger.automatic = True
                     self.writer.segment_us = 30_000_000
                     self.ledger.persist()
+                elif kind == "finishing" and self.phase == "running":
+                    self.phase = "finishing"
+                    self.finishing_deadline = monotonic() + 45
                 elif kind == "game_start":
                     self.ledger.begin_game(value["game_id"])
                 elif kind == "game_complete":
@@ -435,6 +438,8 @@ class CaptureWorker:
 
     def _monitor_health(self, now: float) -> None:
         """运行阶段检查源健康时间；进入故障尾录后不再将主动停止上报误记为失联。"""
+        if self.phase == "finishing" and now >= self.finishing_deadline:
+            self.fault("shutdown_timeout", "主程序声明收尾后四十五秒仍未停止采集")
         if self.phase != "running":
             return
         health = self.channel.read(self.folder / "主程序健康.json", timestamp="reported_at")

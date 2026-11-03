@@ -156,7 +156,7 @@ def test_delayed_blocking_popup_stops_without_using_old_frame_for_input(run):
 
 def test_ui_no_feedback_pauses_without_retry_and_resume_refuses_unknown_command(run):
     run.pipeline.fault = "no_feedback"
-    run.tick(40)
+    run.tick(80)
     assert run.runtime.status == "paused" and len(run.pipeline.flow_commands) == 1
     before = len(run.pipeline.flow_commands)
     run.tick(20)
@@ -387,7 +387,7 @@ def test_startup_continue_without_feedback_pauses_without_authorizing_or_reclick
     startup_frame(run, "settlement", buttons=(button,))
     startup_frame(run, "settlement", buttons=(button,))
     assert run.runtime.pending_flow and not run.runtime.entry_confirmed
-    run.tick(35)
+    run.tick(80)
     assert run.runtime.status == "paused" and not run.runtime.entry_confirmed
     assert run.pipeline.flow_commands == [("settlement", "continue")]
     assert not run.runtime.completed and not run.runtime.armed_game
@@ -600,6 +600,7 @@ def test_unknown_page_and_match_timeouts(run):
 def test_true_gap_pauses_and_cannot_resume_this_game(run):
     playing(run)
     run.pipeline.device.tracker.state.pending = True
+    run.pipeline.operational.tracker.state.pending = True
     run.tick(2)
     assert run.runtime.status == "paused"
     before = run.pipeline.device.taps

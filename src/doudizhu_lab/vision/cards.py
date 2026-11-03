@@ -252,12 +252,25 @@ class Recognizer:
                 [b for b in red_parts if b[1] >= y and abs(b[0] + b[2] / 2 - x - w / 2) < max(w * 0.45, 4)],
                 key=lambda b: b[1],
             )[:5]
-            if len(aligned) == 5 and all(
+            # 小底牌的K/E抗锯齿后会粘成一块，实际五字母只产生四个连通块。
+            # 仅允许一个约双字高的窄块；最终仍须完整JOKER模板及红黑颜色分类，
+            # 不以普通J、四字母JOKE或单纯纵向长条直接判为王。
+            heights = sorted(b[3] for b in aligned)
+            joined = (
+                len(aligned) == 4
+                and heights[1] > 0
+                and 1.65 * heights[1] <= heights[-1] <= 2.6 * heights[1]
+                and sum(b[3] >= heights[1] * 1.65 for b in aligned) == 1
+                and max(b[2] for b in aligned) <= expected_height * 0.45
+            )
+            if (len(aligned) == 5 or joined) and all(
                 0 <= b[1] - a[1] - a[3] < max(h * 0.8, 8) for a, b in zip(aligned, aligned[1:])
             ):
                 left = min(b[0] for b in aligned)
                 right = max(b[0] + b[2] for b in aligned)
-                joker_groups.append((left, y, right - left, aligned[-1][1] + aligned[-1][3] - y))
+                height = aligned[-1][1] + aligned[-1][3] - y
+                if height >= (right - left) * 3.5:
+                    joker_groups.append((left, y, right - left, height))
         merged_jokers = []
         for j in sorted(joker_groups, key=lambda box: box[3], reverse=True):
             if not any(

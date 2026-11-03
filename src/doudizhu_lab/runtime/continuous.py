@@ -375,8 +375,12 @@ class ContinuousRuntime:
             self.store.set("status", "running")
             self.store.add("resumed", at=self.clock())
 
-    def close(self):
-        """退出时等待在途ADB返回后再关账本；不让迟到记录写入下一任务。"""
+    def close(self, *, evaluate: bool = True) -> None:
+        """退出时等待在途ADB返回后再关账本；不让迟到记录写入下一任务。
+
+        evaluate=True保留旧的隔离调用方式；生产收尾使用False，待机器人专用账本、
+        采集与会话数据库全部关闭后由收尾方评测，关闭评测连接后才执行媒体清理。
+        """
         self.stop(manual=False)
         if self.thread:
             self.thread.join(10)
@@ -386,7 +390,8 @@ class ContinuousRuntime:
             self.bidding.close()
             self.bidding = None
         if self.store:
-            evaluate_run(self.store.folder)
+            if evaluate:
+                evaluate_run(self.store.folder)
             self.store.close()
             self.store = None
 
@@ -525,11 +530,15 @@ class ContinuousRuntime:
                     self.pause("流程识别初始化后仍没有清晰首帧")
                 return
             if flow is None or flow.frame.frame_id == self.last_id:
-                if now - max(self.last_new_at, self._ready_since) > 3:
-                    self.pause("连续流程超过三秒没有新观察")
+                raw = self.pipeline.frame
+                budget = 8 if raw is not None and now - raw.started <= 1 else 3
+                if now - max(self.last_new_at, self._ready_since) > budget:
+                    self.pause(f"连续流程超过{budget}秒没有新观察")
                 return
             if now - flow.frame.started > 1:
-                if now - self.last_new_at > 3:
+                raw = self.pipeline.frame
+                budget = 8 if raw is not None and now - raw.started <= 1 else 3
+                if now - self.last_new_at > budget:
                     self.pause("流程画面持续过期")
                 return
             identity = (flow.frame.serial, flow.frame.stream_id, flow.frame.width, flow.frame.height)
@@ -582,12 +591,76 @@ class ContinuousRuntime:
             if self.quarantined:
                 if not self._quarantine_boundary(flow):
                     return
+            if self.pending_flow and now - self.pending_flow["sent_at"] > 8:
+                self.pause(
+                    "页面操作在证据等待窗口内仍无法唯一确认，禁止重复点击",
+                    scope=FaultScope.EXTERNAL,
+                    code="unknown_flow",
+                )
+                return
             if self.pending_flow:
                 pending = self.pending_flow
-                # 平衡模式在旧按钮已消失时优先继续取证，最多8秒；仅消失并不等于成功。
+                if (
+                    pending["kind"] == "continue"
+                    and snapshot
+                    and getattr(snapshot, "frame", None) is not None
+                    and snapshot.frame.media_pts_us > pending["pts_us"]
+                    and snapshot.state["game_id"] != pending.get("origin_game_id")
+                    and snapshot.observation.get("phase") in ("dealing", "bidding", "doubling", "playing")
+                    and len(snapshot.observation.get("hand") or []) in (17, 20)
+                    and not snapshot.state["capture_incomplete"]
+                    and not snapshot.state["pending"]
+                    and (
+                        snapshot.frame.serial,
+                        snapshot.frame.stream_id,
+                        snapshot.frame.width,
+                        snapshot.frame.height,
+                    )
+                    == self.identity
+                ):
+                    probe = pending.get("new_round_probe")
+                    hand_signature = tuple(sorted(snapshot.observation["hand"]))
+                    raw_context = snapshot.observation.get("frame_context", {})
+                    if (
+                        not probe
+                        or probe[0] != snapshot.state["game_id"]
+                        or probe[3] != hand_signature
+                        or probe[4] != raw_context
+                    ):
+                        pending["new_round_probe"] = (
+                            snapshot.state["game_id"],
+                            snapshot.frame.media_pts_us,
+                            snapshot.frame.frame_id,
+                            hand_signature,
+                            raw_context,
+                        )
+                    elif (
+                        snapshot.frame.frame_id != probe[2]
+                        and snapshot.frame.media_pts_us - probe[1] >= 100_000
+                    ):
+                        self._commit(
+                            "flow_confirmed",
+                            action_id=pending["action_id"],
+                            frame_id=snapshot.frame.frame_id,
+                            pts_us=snapshot.frame.media_pts_us,
+                            evidence="new_round",
+                            proof={
+                                "version": 2,
+                                "frames": [probe[2], snapshot.frame.frame_id],
+                                "game_id": probe[0],
+                                "origin_game_id": pending.get("origin_game_id"),
+                                "raw_round_id": snapshot.observation.get("frame_context", {}).get("round_id"),
+                            },
+                        )
+                        self._confirm_startup_entry(flow, "settlement")
+                        self.pending_flow, self.candidate = None, None
+                elif pending.get("new_round_probe"):
+                    pending.pop("new_round_probe", None)
+            if self.pending_flow:
+                pending = self.pending_flow
+                # 所有模式在旧按钮已消失时继续只读取证，最多8秒；仅消失并不等于成功。
                 # 明确的新页面或本人反馈才确认，等待期间不重复点击，也不补造出牌历史。
-                balanced = self.pipeline.profile.continuous_policy != "strict"
-                evidence_window = 8 if balanced else 3
+                evidence_window = 8
                 present = any(
                     b.kind == pending["kind"]
                     and b.label == pending["label"]
@@ -597,7 +670,16 @@ class ContinuousRuntime:
                 )
                 expected = {
                     "match": {"matching", "dealing", "bidding", "doubling", "playing", "room_confirmation"},
-                    "continue": {"lobby", "room", "matching", "dealing", "bidding", "doubling", "playing"},
+                    "continue": {
+                        "lobby",
+                        "room",
+                        "matching",
+                        "dealing",
+                        "bidding",
+                        "doubling",
+                        "playing",
+                        "room_confirmation",
+                    },
                     "return_lobby": {"lobby", "room"},
                     "decline_bid": {"bidding", "dealing", "doubling", "playing"},
                     "call_landlord": {"bidding", "dealing", "doubling", "playing"},
@@ -642,10 +724,8 @@ class ContinuousRuntime:
                 else:
                     pending["absent_us"] = None
                 if self.pending_flow:
-                    wait_for_evidence = (
-                        balanced
-                        and not present
-                        and (flow.scene == "unknown" or pending.get("absent_us") is not None)
+                    wait_for_evidence = not present and (
+                        flow.scene == "unknown" or pending.get("absent_us") is not None
                     )
                     if wait_for_evidence and not pending.get("evidence_wait_logged"):
                         pending["evidence_wait_logged"] = True
@@ -656,12 +736,6 @@ class ContinuousRuntime:
                             pts_us=flow.frame.media_pts_us,
                             reason="旧按钮消失，等待新阶段或明确反馈",
                             deadline_seconds=8,
-                        )
-                    if now - pending["sent_at"] > (8 if wait_for_evidence else 3):
-                        self.pause(
-                            "页面操作在证据等待窗口内仍无法唯一确认，禁止重复点击",
-                            scope=FaultScope.EXTERNAL,
-                            code="unknown_flow",
                         )
                     return
             if self._wait_for_entry(flow):
@@ -780,12 +854,20 @@ class ContinuousRuntime:
             self._tap(button, flow, opportunity, bidding=bid_decision, bid_deal=bid_deal)
 
     def _tap(self, button, flow, opportunity, *, bidding=None, bid_deal=""):
+        """持久化页面意图后重新取当前按钮，单次发送并单独记录实际帧与源身份。
+
+        调用方持有协调锁；等待USB时释放锁让停止立即撤销授权。明确未发送才撤销占位，
+        返回未知时保留在途状态，只读取证至八秒，不发第二次页面命令。
+        """
+        from doudizhu_lab.domain.inference import frame_context
+
         if self.bot.executor.active:
             self.pause("页面输入与在途出牌冲突")
             return
         self.bot.set_mode("suggest")
         token = self.gate.grant("flow")
         action_id = uuid4().hex
+        origin_snapshot = self.pipeline.bot_snapshot()
         record = dict(
             action_id=action_id,
             opportunity=opportunity,
@@ -795,6 +877,13 @@ class ContinuousRuntime:
             pts_us=flow.frame.media_pts_us,
             sent_at=self.clock(),
             origin_scene=flow.scene,
+            frame_context=frame_context(flow.frame),
+            origin_round_id=(
+                origin_snapshot.observation.get("frame_context", {}).get("round_id")
+                if origin_snapshot
+                else None
+            ),
+            origin_game_id=(origin_snapshot.state["game_id"] if origin_snapshot else self.current_game),
             button_box=[button.hit.x, button.hit.y, button.hit.width, button.hit.height],
             x=button.hit.x + button.hit.width // 2,
             y=button.hit.y + button.hit.height // 2,
@@ -803,7 +892,8 @@ class ContinuousRuntime:
             record.update(bidding=decision_dict(bidding), bid_deal=bid_deal)
         self.pending_flow = record.copy()
         self.sent_opportunities.add(opportunity)
-        self._commit("flow_sent", **record)
+        # 意图先持久化到父任务；ACK期间画面可能变旧，真正发送前重新定位同一机会。
+        self._commit("flow_intent", **record)
         self.pipeline.evidence.submit(flow.frame, [action_id])
 
         def guard():
@@ -818,10 +908,12 @@ class ContinuousRuntime:
                 and newest.scene == flow.scene
                 and (
                     not bidding
-                    or bidding.kind == "decline_bid"
                     or (
-                        Counter(newest.bid_hand or ()) == Counter(bidding.hand)
-                        and newest.bid_deal_id == flow.bid_deal_id
+                        newest.bid_deal_id == flow.bid_deal_id
+                        and (
+                            bidding.kind == "decline_bid"
+                            or Counter(newest.bid_hand or ()) == Counter(bidding.hand)
+                        )
                     )
                 )
                 and raw
@@ -838,7 +930,40 @@ class ContinuousRuntime:
 
         # advance持有状态锁；设备命令可能等待USB，发送前释放，确保GUI停止不被它阻塞。
         self.lock.release()
+        sent_recorded = False
         try:
+            newest = self.pipeline.flow_snapshot()
+            if newest and newest.scene == flow.scene and newest.frame.frame_id != flow.frame.frame_id:
+                replacement = next(
+                    (
+                        b
+                        for b in newest.buttons
+                        if b.kind == button.kind
+                        and b.label == button.label
+                        and b.enabled
+                        and abs(b.hit.x - button.hit.x) < 15
+                        and abs(b.hit.y - button.hit.y) < 15
+                    ),
+                    None,
+                )
+                if replacement and (
+                    not bidding
+                    or (
+                        newest.bid_deal_id == flow.bid_deal_id
+                        and Counter(newest.bid_hand or ()) == Counter(bidding.hand)
+                    )
+                ):
+                    flow, button = newest, replacement
+                    self.store.observation(flow)
+            record.update(
+                frame_id=flow.frame.frame_id,
+                pts_us=flow.frame.media_pts_us,
+                sent_at=self.clock(),
+                button_box=[button.hit.x, button.hit.y, button.hit.width, button.hit.height],
+                x=button.hit.x + button.hit.width // 2,
+                y=button.hit.y + button.hit.height // 2,
+            )
+            self.pending_flow = record.copy()
             box = button.hit
             self.gate.tap(
                 "flow",
@@ -850,15 +975,31 @@ class ContinuousRuntime:
                 guard=guard,
                 cancelled=lambda: not self.active,
             )
+            sent_recorded = True
+            self._commit("flow_sent", **record)
             self.store.add("flow_returned", action_id=action_id, at=self.clock())
         except InputRejected as exc:
-            self._commit("flow_not_sent", action_id=action_id, message=str(exc))
+            self._commit("flow_not_sent", action_id=action_id, message=str(exc), code=exc.code)
             self.pending_flow = None
             self.sent_opportunities.discard(opportunity)
-            self.pause(f"页面输入未发送：{exc}")
+            self.candidate = None
+            if exc.code == "stale_frame":
+                self.reason = "画面过期，等待新帧重新核对页面按钮"
+            elif self.active:
+                self.pause(f"页面输入未发送：{exc}")
         except Exception as exc:
+            if not sent_recorded:
+                sent_recorded = True
+                self._commit("flow_sent", **record)
             self.store.add("flow_unknown", action_id=action_id, message=str(exc))
-            self.pause(f"页面命令结果未知：{exc}", scope=FaultScope.EXTERNAL, code="unknown_flow")
+            if (
+                self.pipeline.stop_event.is_set()
+                or getattr(self.pipeline, "failed", False)
+                or not self.pipeline.allowed
+            ):
+                self.pause("设备、前台或采集已失效，页面命令保持未确认")
+            else:
+                self.reason = "页面命令结果未知，只读等待推进证据，禁止重复点击"
         finally:
             self.lock.acquire()
 
@@ -978,11 +1119,8 @@ class ContinuousRuntime:
             own_actions=len(confirmed_ids) if rule_game else len(expected),
             confirmed_actions=len(confirmed_ids) if rule_game else len(confirmed),
             degraded=rule_game,
-            strict_complete=bool(
-                state["complete"]
-                and not rule_game
-                and not any(e.get("source") == "operational_inferred" for e in snapshot.history)
-            ),
+            strict_complete=bool(state["complete"] and not rule_game),
+            raw_visual_complete=not any(e.get("source") == "operational_inferred" for e in snapshot.history),
             inferred_events=sum(e.get("source") == "operational_inferred" for e in snapshot.history),
             strategy_counts=dict(Counter(d.get("strategy", "wp") for d in starts.values())),
             frame_id=snapshot.frame.frame_id,

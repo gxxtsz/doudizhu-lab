@@ -103,7 +103,28 @@ class ControlRecognizer:
                 strip = frame.rgb[top:bottom, max(0, x - 3) : x + 4].astype(np.int16)
                 white = (strip.min(axis=2) > 175) & ((strip.max(axis=2) - strip.min(axis=2)) < 45)
                 if not strip.size or float(white.mean()) < 0.8:
-                    edge = None
+                    # 双王高亮金框可能恰好覆盖窄采样列。字形高度已经排除动画中间态，
+                    # 再在该牌内部多个位置检查浅色顶边；不移动到邻牌或人物白色衣服。
+                    limit = (
+                        cards[index + 1]["box"]["x"] - 3
+                        if index + 1 < len(cards)
+                        else box["x"] + box["width"]
+                    )
+                    samples = []
+                    for probe in (box["x"] + box["width"] * r for r in (0.2, 0.65, 0.85)):
+                        px = round(probe)
+                        if px - 2 < box["x"] or px + 3 > limit:
+                            continue
+                        accepted = False
+                        for offset in (0, round(12 * scale)):
+                            patch = frame.rgb[top + offset : bottom + offset, px - 2 : px + 3].astype(
+                                np.int16
+                            )
+                            valid = (patch.min(axis=2) > 175) & ((patch.max(axis=2) - patch.min(axis=2)) < 45)
+                            accepted |= bool(patch.size and float(valid.mean()) >= 0.8)
+                        samples.append(accepted)
+                    if sum(samples) < 2:
+                        edge = None
             is_selected = None
             if edge is not None:
                 if abs(edge - normal) <= tolerance:

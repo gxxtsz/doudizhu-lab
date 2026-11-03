@@ -11,6 +11,7 @@ from doudizhu_lab.agents.douzero import TO_NUMBER, context
 from doudizhu_lab.agents.readiness import ObservationWait
 from doudizhu_lab.devices.adb import InputRejected
 from doudizhu_lab.domain.bot_types import Decision, ObservationSnapshot
+from doudizhu_lab.domain.inference import EVIDENCE_WAIT_SECONDS
 
 
 def execution_context(snapshot, strategy="wp"):
@@ -86,6 +87,7 @@ class ActionExecutor:
         self.last_selection = None
         self.wait_since = None
         self.layout_wait_since = None
+        self.stale_since = None
         self.identity = (
             snapshot.frame.serial,
             snapshot.frame.stream_id,
@@ -94,6 +96,7 @@ class ActionExecutor:
         )
         self.before_hand = Counter(state["hand"])
         self.before_counts = dict(state["remaining"])
+        self.before_order = list(state["seat_order"])
         self.rule_feedback = None
         self.confirmation_evidence = None
         self._log("开始", snapshot, decision=asdict(decision), input_context=data)
@@ -110,7 +113,12 @@ class ActionExecutor:
             from doudizhu_lab.agents.rules import feedback
 
             value = feedback(
-                snapshot, self.decision, self.before_hand, self.before_counts, self.submitted_pts
+                snapshot,
+                self.decision,
+                self.before_hand,
+                self.before_counts,
+                self.submitted_pts,
+                seat_order=getattr(self, "before_order", ()),
             )
             if value is None:
                 self.rule_feedback = None
@@ -155,21 +163,34 @@ class ActionExecutor:
             expected = self.before_hand - Counter(self.decision.cards)
             # 最后一手可以由明确结算和零剩牌证据确认，不要求消失的手牌仍能识别。
             hand_ok = obs.get("hand") is not None and Counter(obs["hand"]) == expected
+            inference = event.get("data", {}).get("inference", {})
+            proved = (
+                inference.get("version") == 2
+                and inference.get("kind") == "play"
+                and Counter(inference.get("conclusion", {}).get("after_hand", [])) == expected
+                and len(set(inference.get("frames", []))) == 2
+            )
             final = not expected and state["ended"] and state["remaining"]["self"] == 0
             return (
-                (hand_ok or final)
+                (hand_ok or final or proved)
                 and Counter(state["hand"] or []) == expected
                 and (state["turn"] > self.decision.turn or state["ended"])
             )
         # 不出字样可能在行动者稳定前已经消失。观察器已保存本轮提交后的两帧明确提示，
-        # 就不再要求它持续留在当前画面；不得用推断事件或单纯按钮消失替代实际反馈。
+        # 就不再要求它持续留在当前画面；第二版不出推断还须绑定本次提交后的独立双帧，
+        # 单纯按钮消失、输入意图和命令返回均不能替代实际反馈。
         proof = event.get("data", {}).get("evidence_frames", [])
         observed = event.get("source", "automatic") in ("automatic", "operational_observed")
         inference = event.get("data", {}).get("inference", {})
         own_inferred = bool(
             event.get("source") == "operational_inferred"
-            and inference.get("own_pass_after_submission")
-            and inference.get("submission_pts_us") == self.submitted_pts
+            and (
+                (
+                    inference.get("own_pass_after_submission")
+                    and inference.get("submission_pts_us") == self.submitted_pts
+                )
+                or (inference.get("version") == 2 and inference.get("kind") == "pass")
+            )
             and len(set(inference.get("frames", []))) == 2
             and inference.get("to_us", 0) - inference.get("from_us", 0) >= 100_000
             and inference.get("from_us", 0) > self.submitted_pts
@@ -195,6 +216,9 @@ class ActionExecutor:
             self.cancel("设备、方向或视频会话已变化")
             return
         if self.stage == "等待反馈":
+            if now - self.submitted_at > EVIDENCE_WAIT_SECONDS:
+                self.cancel("提交后无法确认结果（已等待八秒），禁止重复提交，请人工接管")
+                return
             if snapshot is not None and not snapshot.allowed:
                 self.cancel("提交后视频中断或画面过期，结果尚未确认")
                 return
@@ -203,6 +227,7 @@ class ActionExecutor:
                 self.last_snapshot = snapshot
                 if self._confirmed(snapshot):
                     self.stage = "已确认"
+                    self.reason = ""
                     self._log(
                         "已确认",
                         snapshot,
@@ -216,18 +241,29 @@ class ActionExecutor:
             animation = (len(cards) == 4 and len(set(cards)) == 1) or set(cards) == {"SJ", "BJ"}
             feedback_budget = self.settings["confirmation_timeout"] + (2 if animation else 0)
             if now - self.submitted_at > feedback_budget:
+                if (
+                    snapshot is not None
+                    and now - snapshot.frame.started <= 1
+                    and now - self.submitted_at <= EVIDENCE_WAIT_SECONDS
+                ):
+                    self.reason = "已提交，正在等待确定性反馈；不重复点击"
+                    return
                 self.cancel("提交后无法确认结果，禁止重复提交，请人工接管")
             return
         if now - self.started > self.settings["selection_timeout"]:
             self.cancel("选牌或按钮确认超过时间预算，请人工接管")
             return
-        if (
-            snapshot is None
-            or not snapshot.allowed
-            or now - snapshot.frame.started > self.settings["max_frame_age"]
-        ):
+        if snapshot is None or not snapshot.allowed:
             self.cancel("没有新鲜且允许控制的画面")
             return
+        if now - snapshot.frame.started > self.settings["max_frame_age"]:
+            self.stale_since = now if self.stale_since is None else self.stale_since
+            self.stable_since = None
+            self.reason = "画面过期，等待新帧重新核对"
+            if now - self.stale_since > EVIDENCE_WAIT_SECONDS:
+                self.cancel("持续无法取得新鲜操作画面")
+            return
+        self.stale_since = None
         if snapshot.frame.frame_id == self.last_frame:
             return
         self.last_frame, self.last_snapshot = snapshot.frame.frame_id, snapshot
@@ -282,8 +318,8 @@ class ActionExecutor:
         if card:
             self.stable_since = None
             self.stage = "选牌"
-            self._tap("select", card.hit, snapshot)
-            if self.active:
+            sent = self._tap("select", card.hit, snapshot)
+            if sent and self.active:
                 self.tap_pending = selected, now
             return
         button = next((b for b in snapshot.buttons if b.kind == self.decision.kind and b.enabled), None)
@@ -308,18 +344,27 @@ class ActionExecutor:
         self._tap(self.decision.kind, button.hit, snapshot)
 
     def _tap(self, kind, rect, snapshot):
+        """返回是否实际交给底层发送；明确未发送可重新核对，未知提交只能等待反馈。"""
         x, y = rect.x + rect.width // 2, rect.y + rect.height // 2
         self._log("准备输入", snapshot, kind=kind, x=x, y=y)
         try:
             self.send(kind, x, y, snapshot, self.action_id)
         except InputRejected as exc:
-            self._log("输入未发送", snapshot, kind=kind, message=str(exc))
+            self._log("输入未发送", snapshot, kind=kind, message=str(exc), code=exc.code)
             if kind in ("play", "pass"):
                 self.sent_turns.discard((self.decision.game_id, self.decision.turn))
-            self.cancel(f"输入在发送前被拒绝：{exc}")
-            return
+            if exc.code == "stale_frame":
+                self.stage, self.reason = "核对", "画面过期，等待新帧重新核对"
+                self.stable_since = self.tap_pending = None
+            else:
+                self.cancel(f"输入在发送前被拒绝：{exc}")
+            return False
         except Exception as exc:
             self._log("命令结果未知", snapshot, kind=kind, message=str(exc))
-            self.cancel(f"输入失败或执行结果未知：{exc}")
-            return
+            if kind in ("play", "pass"):
+                self.reason = "提交命令结果未知，只读等待确定性反馈"
+            else:
+                self.cancel(f"输入失败或执行结果未知：{exc}")
+            return False
         self._log("命令已返回", snapshot, kind=kind, x=x, y=y)
+        return True

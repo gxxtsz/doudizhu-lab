@@ -144,9 +144,7 @@ class RecordingPipeline:
         self._last_card_enabled = False
         from doudizhu_lab.runtime.operational import OperationalObserver
 
-        self.operational = (
-            OperationalObserver(self.profile) if self.profile.continuous_policy != "strict" else None
-        )
+        self.operational = OperationalObserver(self.profile)
         self.sampler = MediaSampler(10)
         # 两条识别线程各保留一个在途任务，不再积压旧帧；忙时跳分析，原录像完整保存。
         self.analysis_pool = OrderedAnalyzer(self._recognizer_factory, capacity=2) if analyze else None
@@ -752,6 +750,10 @@ class RecordingPipeline:
                         from dataclasses import asdict
 
                         history.append(asdict(event))
+                from doudizhu_lab.domain.inference import frame_context
+
+                observation.frame_context = frame_context(frame)
+                observation.frame_context["round_id"] = update.state.game_id
                 self.session.add_observation(observation)
                 for event in update.events:
                     if event.kind in ("play", "pass") and event.confirmed:
@@ -861,6 +863,7 @@ class RecordingPipeline:
         """
         if self.closed:
             return self.result
+        self.begin_finishing()
         self.closed = True
         self._health_stop.set()
         for thread in self.threads:
@@ -959,3 +962,15 @@ class RecordingPipeline:
             },
         )
         return self.result
+
+    def begin_finishing(self) -> None:
+        """在协调器收尾前声明停止阶段；独立采集继续监测写盘，避免把主动停止当心跳失联。
+
+        只排队本会话的本地控制命令，不操作手机。独立进程仍有45秒收尾期限，
+        不能因该阶段永久关闭失联保护；重复调用不延长截止时间。
+        """
+        if getattr(self, "_finishing_declared", False):
+            return
+        self._finishing_declared = True
+        if self.remote_capture:
+            self.stream.command("finishing")

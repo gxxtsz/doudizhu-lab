@@ -264,6 +264,7 @@ class GameTracker:
         self._active_started = False
         self._deal_hand = None
         self._redeal_probe = None
+        self._action_deadline_us = None
 
     def _value(self, key, value, pts):
         """普通牌面/计数要求连续一致；未知立即打断，不与不出文字的容错混用。"""
@@ -795,7 +796,12 @@ class GameTracker:
             expired = [
                 c
                 for c in self._candidates
-                if flush or obs.pts_us - c["first_us"] >= self.config.candidate_wait_us
+                if flush
+                or obs.pts_us
+                >= max(
+                    c["first_us"] + self.config.candidate_wait_us,
+                    min(c["first_us"] + 8_000_000, self._action_deadline_us or 0),
+                )
             ]
             if not expired:
                 break
@@ -807,11 +813,17 @@ class GameTracker:
                 )
             self._publish(update, obs, first, False)
 
-    def observe(self, obs: TableObservation) -> TrackerUpdate:
-        """消费一帧并返回已确认事件、疑点和当前候选；重复或倒序源帧不会推进状态。"""
+    def observe(self, obs: TableObservation, *, action_deadline_us: int | None = None) -> TrackerUpdate:
+        """消费一帧并返回已确认事件、疑点和当前候选；重复或倒序源帧不会推进状态。
+
+        action_deadline_us仅供运行观察器在真实单次提交后延长只读取证期限，使用源媒体
+        微秒时间。普通候选沿用冻结配置的三秒窗口，延长也不能超过候选首证据后八秒；
+        不刷新原始时间、不证明已出牌，不会恢复已确认的缺口或推迟新局边界的清算。
+        """
         update = TrackerUpdate(self.state)
         if obs.frame_id == self._last_frame or obs.pts_us <= self._last_pts:
             return update
+        self._action_deadline_us = action_deadline_us
         self._last_frame, self._last_pts = obs.frame_id, obs.pts_us
         phase = self._value("phase", obs.phase if obs.phase != "unknown" else None, obs.pts_us)
         hand = self._value("hand", canonical(obs.hand), obs.pts_us)

@@ -40,3 +40,5 @@ class TableObservation:
     pass_labels: dict[str, str] = field(default_factory=dict)
     # 每项保存原图框、原始文字、匹配分数及拒识原因；旧观察缺少该字段时使用空字典。
     marker_evidence: dict[str, dict] = field(default_factory=dict)
+    # 原始帧的设备、编码会话和尺寸；确定性证明用它拒绝跨流或方向变化的锚点。
+    frame_context: dict = field(default_factory=dict)

@@ -237,7 +237,7 @@ class TaskSupervisor:
                 self._record(event["event_id"], kind, **value)
         else:
             self._record(event["event_id"], kind, **value)
-        if kind == "flow_sent":
+        if kind in ("flow_intent", "flow_sent"):
             self.blocked_flow = value
         elif kind in ("flow_confirmed", "flow_retired", "flow_not_sent"):
             if self.blocked_flow and self.blocked_flow["action_id"] == value["action_id"]:

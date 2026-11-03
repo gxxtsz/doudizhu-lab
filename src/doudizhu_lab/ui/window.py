@@ -416,8 +416,12 @@ class MainWindow(QMainWindow):
 
         def save():
             try:
+                if hasattr(pipeline, "begin_finishing"):
+                    pipeline.begin_finishing()
                 if continuous:
-                    continuous.close()
+                    continuous.close(evaluate=False)
+                if self.bot:
+                    self.bot.attach(None)
             except Exception as exc:
                 if hasattr(pipeline, "report_failure"):
                     pipeline.report_failure("continuous_shutdown", f"连续任务收尾失败：{exc}")
@@ -431,9 +435,13 @@ class MainWindow(QMainWindow):
                 finally:
                     pipeline.session.close()
             if hasattr(pipeline, "finalize_recording"):
-                result = pipeline.finalize_recording()
                 if isinstance(run_folder, Path):
                     evaluate_run(run_folder)
+                result = pipeline.finalize_recording()
+                if isinstance(run_folder, Path):
+                    from doudizhu_lab.storage.runs import refresh_run_retention
+
+                    refresh_run_retention(run_folder)
                 return result
             return pipeline.session.folder
 
@@ -444,7 +452,11 @@ class MainWindow(QMainWindow):
         self._stop_requested = self._record_stopping = False
         self._requested_action = ""
         self.task_status = self._finish_status
-        if self._saved_folder:
+        result = getattr(self, "_recording_result", None)
+        if result and result.cleanup_pending:
+            self.message = "任务已结束，录像清理等待文件释放；运行摘要已保存"
+            self.log(self.message)
+        elif self._saved_folder:
             if getattr(self, "_recording_result", None) and self._recording_result.reason == StopReason.FAULT:
                 fault = self._recording_result.primary_fault or {}
                 self.message = fault.get("message", "程序异常") + "；录像及诊断资料已保留，可打开本次回放"

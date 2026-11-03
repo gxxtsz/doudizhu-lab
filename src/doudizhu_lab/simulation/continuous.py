@@ -14,6 +14,7 @@ import numpy as np
 
 from doudizhu_lab.agents.backends import create_agent
 from doudizhu_lab.agents.douzero import ROLES
+from doudizhu_lab.domain.bot_types import encode
 from doudizhu_lab.domain.models import Frame, PixelRect
 from doudizhu_lab.domain.table import TableObservation
 from doudizhu_lab.runtime.bot import BotRuntime, InputGate
@@ -70,9 +71,7 @@ class ContinuousSimPipeline:
         self.ending_deadline, self.after_ending = 0, "settlement"
         from doudizhu_lab.runtime.operational import OperationalObserver
 
-        self.operational = (
-            OperationalObserver(self.profile) if self.profile.continuous_policy != "strict" else None
-        )
+        self.operational = OperationalObserver(self.profile)
 
     def enable_flow(self):
         """模拟源已经提供流程观察，无需OCR依赖；不会下载模型或连接手机。"""
@@ -124,6 +123,7 @@ class ContinuousSimPipeline:
                 if self.operational and not self.bid_enabled:
                     # 双轨观察器必须看到相同的发牌/叫抢前缀，不能从出牌阶段中途初始化。
                     for setup in self.device.setup_frames:
+                        setup = self._bind_frame(setup)
                         self.session.add_observation(setup.observation)
                         self.operational.transform(setup)
                     operating_events, notices = self.operational.drain()
@@ -162,9 +162,15 @@ class ContinuousSimPipeline:
                         self._phase("ending" if self.bid_enabled else "settlement")
                 self.device.now, self.device.pts = self.clock() - 0.12, self.pts - 120_000
                 snap = self.device.render()
-                self.latest = replace(snap, frame=replace(snap.frame, stream_id=self.video_id))
+                self.latest = self._bind_frame(snap)
                 self.frame = self.latest.frame
-                self.session.add_observation(self.latest.observation)
+                from doudizhu_lab.domain.inference import frame_context
+
+                raw_observation = self.latest.observation
+                raw_observation["frame_context"] = frame_context(self.latest.frame)
+                raw_observation["frame_context"]["round_id"] = snap.state["game_id"]
+                self.latest = replace(self.latest, observation_json=encode(raw_observation))
+                self.session.add_observation(raw_observation)
                 if self.operational:
                     # 模拟已知UI契约：领出只有出牌按钮；接口仍只读取公开局面。
                     if (
@@ -251,6 +257,7 @@ class ContinuousSimPipeline:
         self.devices[-1] = self.device
         self.pts = self.device.pts
         for setup in self.device.setup_frames:
+            setup = self._bind_frame(setup)
             self.session.add_observation(setup.observation)
             if self.operational:
                 self.operational.transform(setup)
@@ -265,6 +272,15 @@ class ContinuousSimPipeline:
     def bot_snapshot(self):
         with self.lock:
             return self.latest
+
+    def _bind_frame(self, snapshot):
+        """模拟一次真实视频流中的多局画面：编码流不随牌局重建，原始分局标记单独绑定。"""
+        from doudizhu_lab.domain.inference import frame_context
+
+        frame = replace(snapshot.frame, stream_id=self.video_id)
+        observation = snapshot.observation
+        observation["frame_context"] = frame_context(frame) | {"round_id": snapshot.state["game_id"]}
+        return replace(snapshot, frame=frame, observation_json=encode(observation))
 
     def flow_snapshot(self):
         with self.lock:

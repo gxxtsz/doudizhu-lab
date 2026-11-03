@@ -95,6 +95,7 @@ def context(snapshot):
         "target": previous,
         "target_owner": state.get("rule_target_owner"),
         "remaining": dict(state["remaining"]),
+        "seat_order": list(state["seat_order"]),
         "legal_actions": legal_actions(hand, previous),
     }
 
@@ -141,7 +142,7 @@ def decide(snapshot):
     )
 
 
-def feedback(snapshot, decision, before_hand, before_counts, submitted_pts):
+def feedback(snapshot, decision, before_hand, before_counts, submitted_pts, *, seat_order=()):
     """检查规则动作后的单帧反馈，返回可供双帧核对的依据；本函数不确认命令意图。
 
     出牌需要实际手牌差分、本人桌面牌及行动推进，末手允许明确零剩牌结束标记。
@@ -164,10 +165,28 @@ def feedback(snapshot, decision, before_hand, before_counts, submitted_pts):
             and Counter(obs.get("plays", {}).get("self") or []) == Counter(decision.cards)
             and actor in ("left", "right")
         )
-        if not (final or ordinary):
+        # 局部规则仍可验证自己的精确手牌差分；需要三家计数与唯一下一行动者，
+        # 不能用规则建议或按钮消失代替反馈，也不能据此宣称补齐全局历史。
+        visible = obs.get("plays", {}).get("self")
+        difference = bool(
+            len(seat_order) == 3
+            and "self" in seat_order
+            and hand == expected
+            and actor == seat_order[(seat_order.index("self") + 1) % 3]
+            and obs.get("remaining", {}).get("self") == sum(expected.values())
+            and all(obs.get("remaining", {}).get(s) == before_counts.get(s) for s in ("left", "right"))
+            and not (
+                visible
+                and len(visible) == len(decision.cards)
+                and Counter(visible) != Counter(decision.cards)
+            )
+        )
+        if not (final or ordinary or difference):
             return None
         return {
-            "basis": "explicit_final" if final else "hand_play_and_actor",
+            "basis": "explicit_final"
+            if final
+            else ("hand_play_and_actor" if ordinary else "hand_difference_and_unique_actor"),
             "hand": sorted(expected.elements()),
             "cards": list(decision.cards),
         }

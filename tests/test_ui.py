@@ -76,9 +76,10 @@ class FakeContinuous:
     def request_stop(self, reason="用户停止连续任务"):
         self.stop()
 
-    def close(self):
+    def close(self, *, evaluate=True):
         self.stop()
         self.closed += 1
+        self.evaluated_on_close = evaluate
 
     def resume(self):
         if self.reason == "真实历史缺口":

@@ -9,7 +9,7 @@ import stat
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 
 from doudizhu_lab.storage.json_io import atomic_json as atomic_json
 
@@ -27,6 +27,7 @@ class RecordingResult:
     """后台收尾结果；无媒体时回放路径为空，摘要和故障资料仍可独立存在。
 
     primary_fault为最早发生的故障对象，供界面保留首因；无故障或旧调用时为空。
+    cleanup_pending表示资料保存成功但清理仍被共享占用阻挡，不等同于对局或采集故障。
     所有路径来自本次会话收尾，不授权读取之外的设备操作。
     """
 
@@ -35,6 +36,39 @@ class RecordingResult:
     reason: StopReason
     diagnostics_folder: Path | None = None
     primary_fault: dict | None = None
+    cleanup_pending: bool = False
+
+
+def checked_session(path: Path, root: Path) -> Path:
+    """验证活动会话根目录及祖先，不枚举仍在原子发布临时文件的目录树。
+
+    此接口不允许整目录删除。具体媒体删除仍须核对目标文件及其祖先没有重解析点；
+    完整目录删除必须使用checked_tree并保证全部写入者、读取者已经结束。
+    """
+    path, root = Path(os.path.abspath(path)), Path(os.path.abspath(root))
+    if path.parent != root or path.resolve() != path or root.resolve() != root:
+        raise ValueError(f"会话路径越界或包含目录链接：{path}")
+    for entry in (root, path):
+        if entry.exists():
+            attributes = entry.lstat()
+            if stat.S_ISLNK(attributes.st_mode) or getattr(attributes, "st_file_attributes", 0) & 0x400:
+                raise ValueError(f"会话路径包含链接：{entry}")
+    return path
+
+
+def checked_media(path: Path, folder: Path) -> Path:
+    """仅验证本会话video/evidence直接子文件及祖先；不跟随链接或扫描无关临时文件。"""
+    folder = checked_session(folder, folder.parent)
+    if path.parent not in (folder / "video", folder / "evidence") or path.name in ("", ".", ".."):
+        raise ValueError("轮转媒体文件路径越界")
+    for entry in (path.parent, path):
+        try:
+            attributes = entry.lstat()
+        except FileNotFoundError:
+            continue  # 正常轮转可能已处置同一个文件；缺失不等于可以改删其他路径。
+        if stat.S_ISLNK(attributes.st_mode) or getattr(attributes, "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"媒体路径包含链接：{entry}")
+    return path
 
 
 def checked_tree(path: Path, root: Path) -> Path:
@@ -241,7 +275,11 @@ def finalize_retention(folder: Path, root: Path, *, runtime: dict | None = None)
         value = json.loads(summary.read_text(encoding="utf-8"))
         return RecordingResult(summary, None, StopReason(value["reason"]))
     path = folder / "留存记录.json"
-    value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    value = (
+        json.loads(path.read_text(encoding="utf-8"))
+        if path.exists()
+        else (json.loads(summary.read_text(encoding="utf-8")) if summary.exists() else {})
+    )
     if runtime is not None:
         value["runtime"] = runtime
     reason = StopReason.FAULT if value.get("faults") else StopReason(value.get("reason") or StopReason.FAULT)
@@ -251,23 +289,45 @@ def finalize_retention(folder: Path, root: Path, *, runtime: dict | None = None)
     atomic_json(
         summary,
         value
-        | {"reason": reason, "session_id": folder.name, "media_status": "cleaned" if discard else "retained"},
+        | {
+            "reason": reason,
+            "session_id": folder.name,
+            "media_status": "cleanup_pending" if discard else "retained",
+        },
     )
     if discard:
+        deadline = monotonic() + 5
         try:
-            remove_tree(folder, root / "sessions")
+            while True:
+                try:
+                    remove_tree(folder, root / "sessions")
+                    break
+                except OSError as exc:
+                    from doudizhu_lab.storage.json_io import temporary_access_error
+
+                    if not temporary_access_error(exc) or monotonic() >= deadline:
+                        raise
+                    sleep(min(0.1, max(0, deadline - monotonic())))
         except (OSError, ValueError) as exc:
+            from doudizhu_lab.storage.json_io import temporary_access_error
+
+            pending = temporary_access_error(exc)
             atomic_json(
                 summary,
                 value
                 | {
                     "reason": reason,
                     "session_id": folder.name,
-                    "media_status": "cleanup_failed",
+                    "media_status": "cleanup_pending" if pending else "cleanup_failed",
                     "cleanup_error": str(exc),
                 },
             )
+            if pending:
+                return RecordingResult(
+                    summary, folder if playable_video(folder) else None, reason, cleanup_pending=True
+                )
             raise
+        atomic_json(summary, value | {"reason": reason, "session_id": folder.name, "media_status": "cleaned"})
     replay = folder if not discard and playable_video(folder) else None
     return RecordingResult(
         summary, replay, reason, folder if not discard else None, value.get("primary_fault")

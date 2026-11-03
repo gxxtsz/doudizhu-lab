@@ -49,6 +49,7 @@ def test_midgame_gap_waits_for_natural_end_and_never_rearms_same_game(run):
     playing(run)
     game = run.runtime.current_game
     run.pipeline.device.tracker.state.pending = True
+    run.pipeline.operational.tracker.state.pending = True
     run.tick()
     assert run.runtime.quarantined and run.runtime.status == "running"
     before = run.pipeline.device.taps

@@ -25,7 +25,7 @@ def run_session_process(config, connection, parent_heartbeat, cancelled):
     from doudizhu_lab.runtime.recording import RecordingPipeline
     from doudizhu_lab.storage.config import Store
     from doudizhu_lab.storage.retention import StopReason
-    from doudizhu_lab.storage.runs import evaluate_run
+    from doudizhu_lab.storage.runs import evaluate_run, refresh_run_retention
     from doudizhu_lab.vision.flow import FlowRecognizer
 
     root = Path(config["root"])
@@ -67,17 +67,22 @@ def run_session_process(config, connection, parent_heartbeat, cancelled):
         run_folder = runtime.store.folder if runtime and runtime.store else None
         folder = pipeline.session.folder if pipeline else None
         try:
+            if pipeline:
+                pipeline.begin_finishing()
             if runtime:
-                runtime.close()
+                runtime.close(evaluate=False)
+            bot.attach(None)
             if pipeline:
                 try:
                     pipeline.stop(reason)
                 finally:
                     pipeline.session.close()
+                if run_folder:
+                    evaluate_run(run_folder)
                 result = pipeline.finalize_recording()
                 send("session_closed", folder=str(folder), replay=str(result.replay_folder or ""))
             if run_folder:
-                evaluate_run(run_folder)
+                refresh_run_retention(run_folder)
             send("finished")
         except Exception as exc:
             send("fault", code="shutdown", scope="session", message=f"执行会话收尾失败：{exc}")

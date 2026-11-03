@@ -51,6 +51,7 @@ class RunStore:
             else "不叫、不抢、不加倍",
             "status": "running",
             "configuration_version": CONFIGURATION_VERSION,
+            "evidence_policy_version": 2,
         }.items():
             result.set(key, value)
         return result
@@ -108,6 +109,7 @@ class RunStore:
         result = cls(Path(root) / "runs" / ident)
         for key, value in {
             "version": 2,
+            "evidence_policy_version": 2,
             "run_id": ident,
             "profile": asdict(profile),
             "device": serial,
@@ -186,13 +188,24 @@ def verify_rule_feedback(start, submitted, confirmed, observations):
         values = [observations[f] for f in frames]
         if len(set(frames)) != 2 or values[-1]["pts_us"] - values[0]["pts_us"] < 100_000:
             return False
+        if data.get("seat_order") and (
+            not values[0].get("frame_context") or values[0]["frame_context"] != values[1].get("frame_context")
+        ):
+            return False
         before = Counter(TO_RANK[n] for n in data["player_hand_cards"])
         intent = SimpleNamespace(cards=decision["cards"])
         for observation in values:
             snap = SimpleNamespace(
                 observation=observation, frame=SimpleNamespace(media_pts_us=observation["pts_us"])
             )
-            result = feedback(snap, intent, before, data["remaining"], submitted["pts_us"])
+            result = feedback(
+                snap,
+                intent,
+                before,
+                data["remaining"],
+                submitted["pts_us"],
+                seat_order=data.get("seat_order", ()),
+            )
             if result is None or result["basis"] != confirmed["feedback"]["basis"]:
                 return False
     except (KeyError, TypeError, ValueError):
@@ -200,9 +213,17 @@ def verify_rule_feedback(start, submitted, confirmed, observations):
     return True
 
 
-def verify_inference(event, before, observations):
-    """核对推断不出的两个原始行动者/计数锚点；有牌数变化或轮转不唯一则拒绝。"""
+def verify_inference(event, before, observations, *, expected_context=None):
+    """按证明版本独立核对原始锚点；第二版使用前置状态指纹和唯一约束重新求解。
+
+    第一版旧记录保留原不出检查口径；expected_context由本局原始开局帧提供，
+    只参与第二版校验，不用新的验收规则倒改历史成绩。返回False保留明确证明错误。
+    """
     proof = event.get("data", {}).get("inference", {})
+    if proof.get("version") == 2:
+        from doudizhu_lab.domain.inference import verify_proof
+
+        return verify_proof(event, before, observations, expected_context=expected_context)
     try:
         values = [observations[f] for f in proof["frames"]]
         if len(values) != 2 or values[-1]["pts_us"] - values[0]["pts_us"] < 100_000 or not before.last_play:
@@ -219,6 +240,46 @@ def verify_inference(event, before, observations):
     except (KeyError, ValueError, TypeError):
         return False
     return True
+
+
+def verify_flow_transition(sent: dict, confirmed: dict, observations: dict[str, dict]) -> bool:
+    """独立检查续局的新牌局双帧证据；仅点击返回、按钮消失或结果标记不构成证明。
+
+    observations必须来自会话原始观察表，不能使用运行时替换后的视图。旧版本未使用
+    此证明形状，不经本接口改写历史页面反馈结论。
+    """
+    try:
+        proof = confirmed["proof"]
+        a, b = [observations[f] for f in proof["frames"]]
+        return bool(
+            proof["version"] == 2
+            and sent["kind"] == "continue"
+            and sent["origin_scene"] == "settlement"
+            and proof["game_id"] != proof.get("origin_game_id")
+            and proof.get("origin_game_id") == sent.get("origin_game_id")
+            and a["frame_id"] != b["frame_id"]
+            and sent["pts_us"] < a["pts_us"] < b["pts_us"] <= confirmed["pts_us"]
+            and b["pts_us"] - a["pts_us"] >= 100_000
+            and b["pts_us"] - sent["pts_us"] <= 8_000_000
+            and a.get("frame_context")
+            and a["frame_context"] == b.get("frame_context")
+            and bool(proof.get("raw_round_id"))
+            and a["frame_context"].get("round_id") == proof["raw_round_id"]
+            and proof["raw_round_id"] != sent.get("origin_round_id")
+            and sent.get("frame_context")
+            and all(
+                a["frame_context"].get(key) == sent["frame_context"].get(key)
+                for key in ("serial", "stream_id", "width", "height")
+            )
+            and all(
+                o.get("phase") in ("dealing", "bidding", "doubling", "playing")
+                and len(o.get("hand") or []) in (17, 20)
+                for o in (a, b)
+            )
+            and Counter(a["hand"]) == Counter(b["hand"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def evaluate_run(folder, *, output=None):
@@ -286,8 +347,8 @@ def evaluate_run(folder, *, output=None):
     video_closed, capture_issues, submissions, illegal = simulation, [], [], []
     game_audits = []
     policy = meta.get("profile", {}).get("continuous_policy", "strict")
-    operational_events, actions = [], []
-    inference_errors = []
+    operational_events, actions, events = [], [], []
+    inference_errors, flow_proof_errors, submission_errors = [], [], []
     db_path = session / "session.sqlite3"
     if db_path.exists():
         with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
@@ -295,7 +356,9 @@ def evaluate_run(folder, *, output=None):
             all_issues = [json.loads(v[0]) for v in db.execute("SELECT payload FROM issues")]
             events = [json.loads(v[0]) for v in db.execute("SELECT payload FROM events ORDER BY seq")]
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if policy != "strict" and "operational_events" in tables:
+            if (
+                policy != "strict" or meta.get("evidence_policy_version", 1) >= 2
+            ) and "operational_events" in tables:
                 operational_events = [
                     json.loads(v[0])
                     for v in db.execute("SELECT payload FROM operational_events ORDER BY seq")
@@ -306,25 +369,49 @@ def evaluate_run(folder, *, output=None):
                     for (payload,) in db.execute("SELECT payload FROM observations")
                     for value in [json.loads(payload)]
                 }
-                if policy != "strict"
+                if policy != "strict" or meta.get("evidence_policy_version", 1) >= 2
                 else {}
             )
         if operational_events:
             events = operational_events
+        sends_by_id = {s["action_id"]: s for s in sends}
+        for kind, record in journal:
+            if kind == "flow_confirmed" and record.get("evidence") == "new_round":
+                if not verify_flow_transition(
+                    sends_by_id.get(record["action_id"], {}), record, observation_map
+                ):
+                    flow_proof_errors.append(record["action_id"])
         completed_ids = {g["game_id"] for g in games}
         starts = {a["action_id"]: a.get("decision", {}) for a in actions if a["stage"] == "开始"}
-        rejected = {a["action_id"] for a in actions if a["stage"] == "输入未发送"}
+        rejected = {
+            (a["action_id"], a.get("frame_id"), a.get("kind")) for a in actions if a["stage"] == "输入未发送"
+        }
+        resolved = {a["action_id"] for a in actions if a["stage"] == "已确认"}
+        # 第二版必须同时存在一次准备记录和一次真实调用结果。准备写入本身只是意图，
+        # 明确未发送不能算提交；超时后的未知结果允许由原始画面证明，但不能重复发送。
+        attempted = Counter(
+            (a["action_id"], a.get("frame_id"), a.get("kind"))
+            for a in actions
+            if a["stage"] in ("命令已返回", "命令结果未知") and a.get("kind") in ("play", "pass")
+        )
+        submitted_records = {}
         for a in actions:
             if a.get("game_id") not in completed_ids:
                 continue
             if (
                 a["stage"] == "准备输入"
                 and a.get("kind") in ("play", "pass")
-                and a["action_id"] not in rejected
+                and (a["action_id"], a.get("frame_id"), a.get("kind")) not in rejected
             ):
                 d = starts.get(a["action_id"], {})
                 submissions.append((a["game_id"], d.get("turn")))
-            if a["stage"] == "命令结果未知":
+                submitted_records.setdefault(a["action_id"], []).append(a)
+                if (
+                    meta.get("evidence_policy_version", 1) >= 2
+                    and attempted[a["action_id"], a.get("frame_id"), a.get("kind")] != 1
+                ):
+                    submission_errors.append(a["action_id"])
+            if a["stage"] == "命令结果未知" and a["action_id"] not in resolved:
                 illegal.append(a)
         # 只有与完成牌局时间重叠的物理缺口影响这些牌局；大厅前后的正常等待不串局。
         from doudizhu_lab.storage.session import ANALYSIS_GAP_CODES, HARD_GAP_CODES
@@ -345,11 +432,19 @@ def evaluate_run(folder, *, output=None):
         from doudizhu_lab.domain.tracker import GameState, apply_event, replay_events
 
         before = GameState()
+        round_contexts = {}
         for event in events:
-            if event.get("source") == "operational_inferred" and not verify_inference(
-                event, before, observation_map
-            ):
-                inference_errors.append(event["event_id"])
+            if event["kind"] == "game_start":
+                round_contexts[event["game_id"]] = observation_map.get(event["frame_id"], {}).get(
+                    "frame_context"
+                )
+            if event.get("source") == "operational_inferred":
+                context = round_contexts.get(event["game_id"])
+                if (
+                    meta.get("evidence_policy_version", 1) >= 2
+                    and (not context or not context.get("round_id"))
+                ) or not verify_inference(event, before, observation_map, expected_context=context):
+                    inference_errors.append(event["event_id"])
             before = apply_event(before, event)
 
         states = replay_events(events)
@@ -368,10 +463,24 @@ def evaluate_run(folder, *, output=None):
                     continue
                 decision = starts.get(action["action_id"], {})
                 turn = decision.get("turn")
+                action_sends = submitted_records.get(action["action_id"], [])
+                sent = action_sends[0] if len(action_sends) == 1 else {}
+                actual_submission = meta.get("evidence_policy_version", 1) < 2 or bool(
+                    sent
+                    and action["action_id"] not in submission_errors
+                    and turn in expected
+                    and sent.get("kind")
+                    == expected[turn]["kind"]
+                    == ("play" if decision.get("cards") else "pass")
+                    and expected[turn]["pts_us"] > sent["pts_us"]
+                    and action["pts_us"]
+                    >= (expected[turn].get("data", {}).get("confirmed_at_us") or expected[turn]["pts_us"])
+                )
                 if (
                     turn in expected
                     and Counter(decision.get("cards", [])) == Counter(expected[turn]["cards"])
                     and action.get("source") == expected_source
+                    and actual_submission
                 ):
                     good.add(turn)
             actual = {turn for game_id, turn in submissions if game_id == gid}
@@ -396,6 +505,12 @@ def evaluate_run(folder, *, output=None):
                         valid = False
                         continue
                     decision = start["decision"]
+                    if meta.get("evidence_policy_version", 1) >= 2:
+                        valid = (
+                            valid
+                            and ident not in submission_errors
+                            and len(submitted_records.get(ident, [])) == 1
+                        )
                     if decision.get("strategy", "wp") == "rules":
                         valid = valid and verify_rule_feedback(
                             start, sent[ident], confirmations[ident], observation_map
@@ -450,6 +565,8 @@ def evaluate_run(folder, *, output=None):
         and not capture_issues
         and not illegal
         and not inference_errors
+        and not flow_proof_errors
+        and not submission_errors
         and not bidding_errors
         and video_closed
         and not policy_cleaned
@@ -464,10 +581,22 @@ def evaluate_run(folder, *, output=None):
         "live_passed": passed and not simulation,
         "strict_live_passed": passed
         and not simulation
-        and not any(g.get("degraded") or g.get("inferred_events") for g in games),
+        and not any(
+            g.get("degraded") or (g.get("inferred_events") and meta.get("evidence_policy_version", 1) < 2)
+            for g in games
+        ),
+        "evidence_policy_version": meta.get("evidence_policy_version", 1),
+        "directly_observed_events": sum(e.get("source") != "operational_inferred" for e in events),
+        "inferred_events_by_kind": dict(
+            Counter(e["kind"] for e in operational_events if e.get("source") == "operational_inferred")
+        ),
         "rules_actions": sum(a["stage"] == "已确认" and a.get("strategy") == "rules" for a in actions),
         "inferred_events": sum(e.get("source") == "operational_inferred" for e in operational_events),
+        "valid_inferred_events": sum(e.get("source") == "operational_inferred" for e in operational_events)
+        - len(inference_errors),
         "inference_proof_errors": inference_errors,
+        "flow_proof_errors": flow_proof_errors,
+        "submission_proof_errors": submission_errors,
         "completed_games": len(games),
         "target_reached": len(games)
         >= meta.get("profile", {}).get("continuous_settings", {}).get("max_games", 5),
@@ -536,6 +665,18 @@ def evaluate_task(folder, meta, events, *, output=None):
     )
     result = {
         "source": meta["source"],
+        "evidence_policy_version": meta.get("evidence_policy_version", 1),
+        "directly_observed_events": sum(
+            a.get("report", {}).get("directly_observed_events", 0) for a in audits
+        ),
+        "valid_inferred_events": sum(a.get("report", {}).get("valid_inferred_events", 0) for a in audits),
+        "rules_actions": sum(a.get("report", {}).get("rules_actions", 0) for a in audits),
+        "proof_errors": [
+            {"session": a["session"].get("folder", ""), "kind": kind, "error": error}
+            for a in audits
+            for kind in ("inference_proof_errors", "flow_proof_errors", "submission_proof_errors")
+            for error in a.get("report", {}).get(kind, [])
+        ],
         "status": meta["status"],
         "target_reached": reached,
         "completed_games": len(games),
@@ -553,3 +694,38 @@ def evaluate_task(folder, meta, events, *, output=None):
 
     atomic_json(Path(output) if output else Path(folder) / "连续任务报告.json", result)
     return result
+
+
+def refresh_run_retention(folder: str | Path) -> dict:
+    """在关闭并评测全部数据库、完成媒体处置后，只更新报告的留存状态。
+
+    不重新打开已删除的原始数据库，不用缺失源文件覆盖先前独立核验的计数和证明结果。
+    已按策略清理媒体仍不能声明完整录像验收通过；清理等待不改变目标完成事实。
+    """
+    from doudizhu_lab.storage.json_io import atomic_json
+
+    folder = Path(folder)
+    report_path = folder / "连续任务报告.json"
+    report = json.loads(report_path.read_text(encoding="utf8"))
+    with closing(sqlite3.connect((folder / "run.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        row = db.execute("SELECT payload FROM meta WHERE key='session'").fetchone()
+    if row is None:
+        return report
+    session = Path(json.loads(row[0]))
+    summary = folder.parent.parent / "recording-summaries" / f"{session.name}.json"
+    if summary.is_file():
+        value = json.loads(summary.read_text(encoding="utf8"))
+        status = value.get("media_status", "retained")
+        report["cleanup_pending"] = status == "cleanup_pending"
+        if status == "cleaned":
+            report.update(
+                media_status="policy_cleaned",
+                video_audit_available=False,
+                passed=False,
+                live_passed=False,
+                strict_live_passed=False,
+            )
+        elif status in ("cleanup_pending", "cleanup_failed"):
+            report["media_status"] = status
+        atomic_json(report_path, report)
+    return report

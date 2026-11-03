@@ -224,6 +224,7 @@ class SessionStore:
         result.set_meta("device", device)
         result.set_meta("profile", json_value(profile))
         result.set_meta("version", 2)
+        result.set_meta("evidence_policy_version", 2)
         result.set_meta("analysis_mode", "offline" if device in ("replay", "offline", "test") else "live")
         result.set_meta("tracker_settings", json_value(profile.tracker_settings))
         result.set_meta("engine_sha256", engine_hashes())

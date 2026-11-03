@@ -221,6 +221,10 @@ def test_execution_stops_on_invalid_observation(device, fault):
     if fault == "manual":
         executor.cancel("人工介入")
     executor.advance(snapshot)
+    if fault == "stale":
+        assert executor.active and device.taps == 0
+        device.now += 8.1
+        executor.advance(snapshot)
     if fault == "uncertain":
         assert executor.active and device.taps == 0
         device.now += 3.1
