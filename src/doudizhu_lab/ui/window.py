@@ -348,7 +348,7 @@ class MainWindow(QMainWindow):
             self.continuous = ContinuousRuntime(self.store.root, self.input_gate, self.bot, self.recording)
             self.continuous.start()
             self.task_status, self.message = "running", ""
-            self.log("连续任务已开始，正在确认当前大厅入口")
+            self.log("连续任务已开始，正在确认大厅或结算续局入口")
         except (OSError, ValueError, RuntimeError) as exc:
             self.stop_and_save(f"连续任务启动失败：{exc}", outcome="failed")
 

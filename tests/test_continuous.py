@@ -264,7 +264,51 @@ def startup_frame(run, scene, *, buttons=(), elapsed=0.12, age=0, snapshot=None)
     return flow
 
 
-def test_midgame_start_waits_without_input_then_returns_and_plays_next_complete_game(run):
+@pytest.mark.parametrize("next_scene", ["lobby", "matching"])
+def test_startup_settlement_continues_and_counts_only_next_complete_game(run, monkeypatch, next_scene):
+    """结算页可直接续局；点击确认前不接管旧局，完成数从下一局重新累计。"""
+    run.runtime.settings["max_games"] = 1
+    incomplete = SimpleNamespace(
+        state={"game_id": "ignored-midgame", "capture_incomplete": True, "pending": True}
+    )
+    startup_frame(run, "playing", snapshot=incomplete)
+    original_tap = run.pipeline.tap
+
+    def tap(x, y, frame, *, max_age=1):
+        original_tap(x, y, frame, max_age=max_age)
+        if run.pipeline.flow_commands[-1] == ("settlement", "continue"):
+            run.pipeline._phase(next_scene)
+
+    monkeypatch.setattr(run.pipeline, "tap", tap)
+    buttons = (
+        FlowButton("return_lobby", "退出", PixelRect(150, 65, 100, 25), True),
+        FlowButton("continue", "继续游戏", PixelRect(450, 65, 100, 25), True),
+    )
+    first = startup_frame(run, "settlement", buttons=buttons, snapshot=incomplete)
+    for _ in range(5):
+        run.runtime.advance(first, incomplete)
+    assert not run.pipeline.flow_commands
+    startup_frame(run, "settlement", buttons=buttons, snapshot=incomplete)
+    assert run.pipeline.flow_commands == [("settlement", "continue")]
+    assert run.runtime.startup_phase == "waiting_lobby" and run.runtime.pending_flow
+    assert not run.runtime.current_game and not run.runtime.completed
+    run.tick()
+    assert run.runtime.startup_phase == "ready" and run.runtime.pending_flow is None
+    for _ in range(3000):
+        run.tick()
+        if not run.runtime.active:
+            break
+    assert run.runtime.status == "completed" and len(run.runtime.completed) == 1
+    assert "ignored-midgame" not in run.runtime.completed
+    assert sum(kind == "continue" for _, kind in run.pipeline.flow_commands) == 1
+    assert sum(kind == "match" for _, kind in run.pipeline.flow_commands) == (next_scene == "lobby")
+    assert not sum(device.invalid + device.duplicate for device in run.pipeline.devices)
+    report = evaluate_run(run.runtime.store.folder)
+    assert report["completed_games"] == 1 and not report["pauses"]
+    assert not report["unconfirmed_flow_actions"] and not report["duplicate_flow_commands"]
+
+
+def test_midgame_start_can_return_to_lobby_when_no_continue_button_is_available(run):
     incomplete = SimpleNamespace(
         state={"game_id": "ignored-midgame", "capture_incomplete": True, "pending": True}
     )
@@ -274,12 +318,11 @@ def test_midgame_start_waits_without_input_then_returns_and_plays_next_complete_
     assert not run.pipeline.flow_commands and not run.runtime.current_game and not run.runtime.completed
     assert "等待" in run.runtime.progress().reason and run.gate.owner is None
     back = FlowButton("return_lobby", "返回大厅", PixelRect(150, 65, 100, 25), True)
-    continue_button = FlowButton("continue", "继续游戏", PixelRect(450, 65, 100, 25), True)
-    first = startup_frame(run, "settlement", buttons=(continue_button, back))
+    first = startup_frame(run, "settlement", buttons=(back,))
     for _ in range(5):
         run.runtime.advance(first, incomplete)
     assert not run.pipeline.flow_commands
-    startup_frame(run, "settlement", buttons=(continue_button, back))
+    startup_frame(run, "settlement", buttons=(back,))
     assert run.pipeline.flow_commands == [("settlement", "return_lobby")]
     match = FlowButton("match", "开始匹配", PixelRect(450, 65, 100, 25), True)
     startup_frame(run, "lobby", buttons=(match,))
@@ -297,14 +340,88 @@ def test_midgame_start_waits_without_input_then_returns_and_plays_next_complete_
     assert report["completed_games"] == 1 and not report["pauses"]
 
 
-@pytest.mark.parametrize("label", [None, "继续游戏", "返回", "退出"])
+@pytest.mark.parametrize("label", [None, "返回", "退出"])
 def test_startup_settlement_without_explicit_back_button_keeps_waiting(run, label):
-    for index in range(3):
-        kind = "continue" if label == "继续游戏" else "return_lobby"
-        buttons = () if label is None else (FlowButton(kind, label, PixelRect(150, 65, 100, 25), True),)
+    for _ in range(3):
+        buttons = (
+            () if label is None else (FlowButton("return_lobby", label, PixelRect(150, 65, 100, 25), True),)
+        )
         startup_frame(run, "settlement", buttons=buttons, elapsed=6)
     assert run.runtime.active and run.runtime.startup_phase == "waiting_lobby"
     assert not run.pipeline.flow_commands and not run.runtime.completed
+
+
+def test_startup_prefers_continue_over_explicit_return_to_lobby(run):
+    """同时提供续局和返回大厅时沿用结算页续局，不增加返回与重新匹配步骤。"""
+    buttons = (
+        FlowButton("return_lobby", "返回大厅", PixelRect(150, 65, 100, 25), True),
+        FlowButton("continue", "再来一局", PixelRect(450, 65, 100, 25), True),
+    )
+    startup_frame(run, "settlement", buttons=buttons)
+    startup_frame(run, "settlement", buttons=buttons)
+    assert run.pipeline.flow_commands == [("settlement", "continue")]
+    assert not run.runtime.entry_confirmed
+    run.tick()
+    assert run.runtime.entry_confirmed and run.runtime.startup_entry == "settlement"
+
+
+@pytest.mark.parametrize("invalid", ["disabled", "stale", "unknown"])
+def test_startup_continue_still_requires_enabled_fresh_settlement_evidence(run, invalid):
+    """续局入口不放宽按钮状态、源帧时效或页面归类；一帧可信证据仍不能点击。"""
+    button = FlowButton("continue", "继续游戏", PixelRect(450, 65, 100, 25), invalid != "disabled")
+    for _ in range(2):
+        startup_frame(
+            run,
+            "unknown" if invalid == "unknown" else "settlement",
+            buttons=(button,),
+            age=1.1 if invalid == "stale" else 0,
+        )
+    assert run.runtime.active and not run.pipeline.flow_commands
+    assert not run.runtime.entry_confirmed and not run.runtime.completed
+
+
+def test_startup_continue_without_feedback_pauses_without_authorizing_or_reclicking(run):
+    """发送成功不等于续局成功；没有页面推进就暂停，不能用重复点击补齐反馈。"""
+    run.pipeline.fault = "no_feedback"
+    button = FlowButton("continue", "再来一局", PixelRect(450, 65, 100, 25), True)
+    startup_frame(run, "settlement", buttons=(button,))
+    startup_frame(run, "settlement", buttons=(button,))
+    assert run.runtime.pending_flow and not run.runtime.entry_confirmed
+    run.tick(35)
+    assert run.runtime.status == "paused" and not run.runtime.entry_confirmed
+    assert run.pipeline.flow_commands == [("settlement", "continue")]
+    assert not run.runtime.completed and not run.runtime.armed_game
+    with pytest.raises(ValueError, match="未确认"):
+        run.runtime.resume()
+
+
+def test_startup_showcase_only_closes_overlay_then_continues_from_settlement(run):
+    """战绩展示的继续只关闭展示，必须再确认正式结算续局才能授权下一局。"""
+    close = FlowButton("close_showcase", "继续", PixelRect(350, 65, 100, 25), True)
+    startup_frame(run, "showcase", buttons=(close,))
+    startup_frame(run, "showcase", buttons=(close,))
+    assert run.pipeline.flow_commands == [("showcase", "close_showcase")]
+    assert not run.runtime.entry_confirmed
+    run.tick()
+    assert run.runtime.pending_flow is None and not run.runtime.entry_confirmed
+    run.tick()
+    assert run.pipeline.flow_commands[-1] == ("settlement", "continue")
+    assert not run.runtime.entry_confirmed
+    run.tick()
+    assert run.runtime.entry_confirmed and run.runtime.startup_phase == "ready"
+
+
+def test_startup_continue_cannot_bypass_missing_history_in_new_game(run):
+    """入口确认只允许进入新局流程，新局自身有真实历史缺口时仍拒绝出牌。"""
+    button = FlowButton("continue", "继续游戏", PixelRect(450, 65, 100, 25), True)
+    startup_frame(run, "settlement", buttons=(button,))
+    startup_frame(run, "settlement", buttons=(button,))
+    incomplete = SimpleNamespace(
+        state={"game_id": "incomplete-next-game", "ended": False, "phase": "playing", "pending": True}
+    )
+    startup_frame(run, "playing", snapshot=incomplete)
+    assert run.runtime.status == "paused" and "历史缺口" in run.runtime.reason
+    assert not run.runtime.armed_game and not run.runtime.completed
 
 
 @pytest.mark.parametrize("elapsed", [1801, 14401])

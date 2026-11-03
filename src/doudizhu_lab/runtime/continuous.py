@@ -19,8 +19,9 @@ class ContinuousProgress:
     """任务界面的只读进度；elapsed 为已运行秒数，不代表任务截止时间。
 
     completed 只统计已确认完成的牌局，total 为无业务上限的 Python 正整数。
-    startup_phase为waiting_lobby时仅等待首次大厅并可返回大厅，为ready后才授权
-    新局流程；默认ready兼容旧调用。等待仍属于running，GUI保留停止按钮。
+    startup_phase 为 waiting_lobby 时等待大厅或结算续局入口，该取值保留旧接口兼容。
+    大厅按钮稳定或结算续局提交得到页面反馈后才进入 ready 并授权新局流程；默认
+    ready 兼容旧调用。等待仍属于 running，GUI 保留停止按钮。
     """
 
     status: str
@@ -37,7 +38,8 @@ class ContinuousRuntime:
 
     pipeline 必须已录制，并提供同帧 flow_snapshot/bot_snapshot；bot 是生产单局协调器。
     start 不授予跨重启权限。暂停只撤销后续输入；已发命令保留在途记录，不能撤回。
-    lobby_confirmed 仅记录本任务观察过有效大厅按钮，不读取旧 mode_verified 字段，
+    lobby_confirmed 仅记录本任务观察过有效大厅按钮，startup_entry 记录首次确认的新局
+    入口。结算续局须收到页面推进反馈后才授权下一局；不读取旧 mode_verified 字段，
     不按玩法名称或场次等级授权；完整开局、稳定帧和提交确认仍由生产流程校验。
     """
 
@@ -61,6 +63,7 @@ class ContinuousRuntime:
         self.identity = None
         # 仅记录是否观察到有效大厅入口，不验证玩法名称或场次等级，也不跨任务恢复。
         self.lobby_confirmed = False
+        self.startup_entry = ""
         self.startup_phase = "waiting_lobby"
         self._finish_wait = None
         self._ready_since = None
@@ -75,6 +78,16 @@ class ContinuousRuntime:
     @property
     def active(self):
         return self.status == "running" and not self.stop_event.is_set()
+
+    @property
+    def entry_confirmed(self) -> bool:
+        """本任务是否已确认新局入口；只允许有效大厅或收到推进反馈的结算续局。
+
+        识别出结算页、点击返回大厅或关闭战绩展示都不能单独授权出牌。入口授权仅在
+        本任务内存中有效，旧观察字段和历史账本不能恢复权限；新局仍须验证完整开局。
+        供流程线程持锁读取，不发送输入；GUI 通过 progress 获取只读进度快照。
+        """
+        return self.lobby_confirmed or self.startup_entry == "settlement"
 
     def progress(self) -> ContinuousProgress:
         """返回只读局数与已用秒数，不发布任务时限；目标局数保持 Python 整数精度。
@@ -122,7 +135,7 @@ class ContinuousRuntime:
             if hasattr(self.pipeline, "enable_automatic_retention"):
                 self.pipeline.enable_automatic_retention()
             self.status, self.started = "running", self.clock()
-            self.reason = "等待当前牌局结束并返回大厅"
+            self.reason = "正在确认大厅或结算页入口"
             self.store.set("startup_phase", self.startup_phase)
             self.store.add("startup_wait_started", at=self.started)
             self.scene_since = self.last_new_at = self.started
@@ -288,12 +301,35 @@ class ContinuousRuntime:
         """只按已确认完成的局数判断任务目标，不限制总用时或等待大厅的时长。"""
         return len(self.completed) >= self.settings["max_games"]
 
-    def _wait_for_lobby(self, flow) -> bool:
-        """处理本任务首次大厅确认前的只读等待；True表示本帧已消费，不进入单局授权。
+    def _confirm_startup_entry(self, flow, entry: str) -> None:
+        """记录首次可信新局入口并结束启动等待；调用方必须已经完成入口证据校验。
 
-        稳定大厅入口允许开始新局；当前牌局及准备页面仅观察，明确结算页只开放
-        返回大厅按钮。所有实际点击仍由原有双帧、时效和发送前检查负责。本局不写
-        game_complete，也不把缺少开局历史计作程序故障。该方法在流程线程锁内调用。
+        entry 为 lobby 时已取得两帧稳定匹配按钮，为 settlement 时结算续局命令已经
+        得到新页面确认。记录只解释本任务从何处启动，不补造旧局历史，也不增加局数。
+        本方法在流程线程锁内调用，不发送设备输入。
+        """
+        if self.startup_phase != "waiting_lobby":
+            return
+        self.startup_phase, self.startup_entry, self.reason = "ready", entry, ""
+        if entry == "lobby":
+            self.lobby_confirmed = True
+        self.store.set("startup_phase", self.startup_phase)
+        self.store.set("startup_entry", entry)
+        self.store.add(
+            "startup_wait_finished",
+            entry=entry,
+            frame_id=flow.frame.frame_id,
+            pts_us=flow.frame.media_pts_us,
+            at=self.clock(),
+        )
+
+    def _wait_for_entry(self, flow) -> bool:
+        """处理首次新局入口确认前的等待；True 表示本帧已消费，不进入单局授权。
+
+        大厅匹配按钮稳定后可开始新局；明确结算页优先续局，也可使用完整文字的返回
+        大厅按钮，战绩展示仅允许关闭。点击均经过原有双帧、时效和发送前检查，续局
+        还须等待页面反馈才能结束启动等待。当前牌局仅观察，不写 game_complete，
+        不把缺少旧局开局历史计作程序故障。本方法在流程线程锁内调用。
         """
         if self.startup_phase != "waiting_lobby":
             return False
@@ -309,31 +345,34 @@ class ContinuousRuntime:
                 return True
             if flow.frame.media_pts_us - self.candidate[1] < 100_000:
                 return True
-            self.startup_phase, self.lobby_confirmed, self.reason = "ready", True, ""
-            self.store.set("startup_phase", self.startup_phase)
-            self.store.add(
-                "startup_wait_finished",
-                frame_id=flow.frame.frame_id,
-                pts_us=flow.frame.media_pts_us,
-                at=self.clock(),
-            )
+            self._confirm_startup_entry(flow, "lobby")
             return False
         if flow.scene in ("unknown", "matching"):
             # 无法识别的页面仍使用原有五秒规则，不能用等待大厅掩盖识别故障。
-            self.reason = "等待确认当前页面并返回大厅"
+            self.reason = "等待确认大厅或结算续局入口"
             return False
         if flow.scene == "settlement":
+            has_continue = any(b.kind == "continue" and b.enabled for b in flow.buttons)
             has_return = any(
                 b.kind == "return_lobby" and b.label == "返回大厅" and b.enabled for b in flow.buttons
             )
-            self.reason = (
-                "正在确认返回大厅按钮" if has_return else "本局已结束，等待返回大厅按钮；也可手动返回"
-            )
-            if not has_return:
+            if has_continue:
+                self.reason = "正在确认继续游戏按钮"
+            elif has_return:
+                self.reason = "正在确认返回大厅按钮"
+            else:
+                self.reason = "本局已结束，等待可用的继续游戏或返回大厅按钮；也可手动返回"
+            if not (has_continue or has_return):
                 self.candidate = None
                 return True
             return False
-        self.reason = "等待当前牌局结束并返回大厅"
+        if flow.scene == "showcase":
+            has_close = any(b.kind == "close_showcase" and b.enabled for b in flow.buttons)
+            self.reason = "正在确认战绩展示的继续按钮" if has_close else "等待可确认的战绩展示关闭按钮"
+            if not has_close:
+                self.candidate = None
+            return not has_close
+        self.reason = "等待当前牌局结束后开始下一局"
         self.candidate = None
         self.gate.revoke()
         return True
@@ -484,6 +523,9 @@ class ContinuousRuntime:
                         )
                         if pending.get("bidding"):
                             self.bidding.committed(self.bid_decision, pending["bid_deal"])
+                        if pending["kind"] == "continue" and pending["origin_scene"] == "settlement":
+                            # 仅在新页面确认续局后授权；点击返回或关闭战绩都不代表已进入新局。
+                            self._confirm_startup_entry(flow, "settlement")
                         self.pending_flow, self.candidate = None, None
                 else:
                     pending["absent_us"] = None
@@ -506,7 +548,7 @@ class ContinuousRuntime:
                     if now - pending["sent_at"] > (8 if wait_for_evidence else 3):
                         self.pause("页面操作在证据等待窗口内仍无法唯一确认，禁止重复点击")
                     return
-            if self._wait_for_lobby(flow):
+            if self._wait_for_entry(flow):
                 return
             if flow.scene == "unknown":
                 if now - self.scene_since > 5:
@@ -517,8 +559,8 @@ class ContinuousRuntime:
                     self.pause("匹配等待超过120秒")
                 return
             if flow.scene == "playing":
-                if not self.lobby_confirmed:
-                    self.pause("连续任务须从已确认的大厅入口开始，不能中途接管未知牌局")
+                if not self.entry_confirmed:
+                    self.pause("连续任务须从已确认的大厅或结算续局入口开始，不能中途接管未知牌局")
                     return
                 self._playing(snapshot)
                 return
@@ -568,8 +610,6 @@ class ContinuousRuntime:
                     )
                 )
                 preferences["bidding"] = (bid_decision.kind,)
-            if flow.scene == "settlement" and not self.lobby_confirmed:
-                preferences["settlement"] = ("return_lobby",)
             button = next(
                 (
                     b
@@ -577,19 +617,24 @@ class ContinuousRuntime:
                     for b in flow.buttons
                     if b.kind == kind
                     and b.enabled
-                    and (self.startup_phase != "waiting_lobby" or b.label == "返回大厅")
+                    and (
+                        self.startup_phase != "waiting_lobby"
+                        or b.kind in ("continue", "close_showcase")
+                        or b.label == "返回大厅"
+                    )
                 ),
                 None,
             )
             if button is None:
                 self.candidate = None
                 return
-            if not self.lobby_confirmed and button.kind not in (
+            if not self.entry_confirmed and button.kind not in (
+                "continue",
                 "return_lobby",
                 "confirm_room",
                 "close_showcase",
             ):
-                self.pause("任务必须先从已确认的大厅入口开始")
+                self.pause("任务必须先从已确认的大厅或结算续局入口开始")
                 return
             opportunity = (
                 bid_decision.opportunity
@@ -728,7 +773,7 @@ class ContinuousRuntime:
 
     def _settlement(self, snapshot):
         if not self.current_game:
-            return True  # 可从大厅外的已结束页面返回大厅，不能把这局计为完成。
+            return True  # 可从已结束页面续局或返回大厅，不能把启动前的旧局计为完成。
         if self.current_game in self.registered:
             return True
         self._finish_wait = self._finish_wait or self.clock()
