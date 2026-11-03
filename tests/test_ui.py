@@ -15,6 +15,7 @@ from doudizhu_lab.domain.models import Device
 from doudizhu_lab.runtime.bot import BotRuntime, ModelStatus
 from doudizhu_lab.runtime.continuous import ContinuousProgress
 from doudizhu_lab.storage.config import Store
+from doudizhu_lab.storage.retention import RecordingResult, StopReason
 from doudizhu_lab.ui.settings import SettingsDialog
 from doudizhu_lab.ui.window import MainWindow
 
@@ -120,7 +121,7 @@ def test_workspace_is_readonly_and_has_no_legacy_controls(window, qtbot):
         assert not hasattr(window, name)
     assert window.acceptance is False
     buttons = [b.text() for b in window.findChildren(QPushButton)]
-    assert "开始连续游戏" in buttons and "停止并保存" in buttons
+    assert "开始连续游戏" in buttons and "停止任务" in buttons
     assert "加载 WP 模型" not in buttons and "原图坐标点击" not in buttons
     window.log("中文状态 <b>也作为纯文本</b>")
     assert "<b>也作为纯文本</b>" in window.log_view.toPlainText()
@@ -256,6 +257,46 @@ def test_recording_failures_remain_actionable(window, backend, qtbot, failure):
     assert not window.saved_replay_button.isVisible()
     backend.pipeline.session.close.assert_called_once()
     backend.pipeline.stop.assert_called_once()
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("reason", [StopReason.USER, StopReason.COMPLETED, StopReason.FAULT])
+def test_typed_recording_result_controls_replay_and_cleanup_message(window, backend, qtbot, tmp_path, reason):
+    replay = tmp_path / "故障录像" if reason == StopReason.FAULT else None
+
+    def finalize():
+        assert backend.pipeline.session.close.call_count == 1
+        return RecordingResult(tmp_path / "摘要.json", replay, reason, replay)
+
+    backend.pipeline.finalize_recording = Mock(side_effect=finalize)
+    window.start_continuous()
+    qtbot.waitUntil(lambda: window.continuous is not None)
+    window.stop_and_save(outcome="completed" if reason == StopReason.COMPLETED else "stopped")
+    qtbot.waitUntil(lambda: window.recording is None and not window.busy)
+    assert window.dashboard_state().saved is (reason == StopReason.FAULT)
+    assert window.saved_replay_button.isVisible() is (reason == StopReason.FAULT)
+    if reason != StopReason.FAULT:
+        assert "已清理" in window.notice_label.text()
+    else:
+        assert window.task_status == "failed"
+
+
+@pytest.mark.gui
+def test_continuous_shutdown_failure_pins_diagnostics(window, backend, qtbot):
+    backend.pipeline.report_failure = Mock()
+    window.start_continuous()
+    qtbot.waitUntil(lambda: window.continuous is not None)
+    window.continuous.close = Mock(side_effect=RuntimeError("模拟流程收尾失败"))
+    window.stop_and_save()
+    qtbot.waitUntil(lambda: window.task_status == "failed" and not window.busy)
+    backend.pipeline.report_failure.assert_called_once_with(
+        "continuous_shutdown", "连续任务收尾失败：模拟流程收尾失败"
+    )
+    backend.pipeline.stop.assert_called_once()
+    backend.pipeline.session.close.assert_called_once()
+    window.close()
+    assert not window.isVisible()
+    assert window.pool.activeThreadCount() == 0
 
 
 @pytest.mark.gui

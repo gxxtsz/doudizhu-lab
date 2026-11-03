@@ -33,6 +33,7 @@ from doudizhu_lab.domain.table import PHASE_NAMES, SEAT_NAMES
 from doudizhu_lab.domain.tracker import replay_events
 from doudizhu_lab.storage.config import Store
 from doudizhu_lab.storage.replay import VideoReplay, profile_from_dict
+from doudizhu_lab.storage.retention import playable_video
 from doudizhu_lab.storage.session import SessionStore
 from doudizhu_lab.ui.canvas import FrameCanvas
 from doudizhu_lab.ui.components import card
@@ -326,6 +327,15 @@ class SessionDialog(QDialog):
         self.sessions.clear()
         for database in sorted((self.store.root / "sessions").rglob("session.sqlite3"), reverse=True):
             folder = database.parent
+            # 离线重算可引用原会话录像；仅过滤明确没有媒体的普通会话。
+            if not playable_video(folder):
+                session = SessionStore(folder, readonly=True)
+                try:
+                    source = session.metadata().get("video_source")
+                finally:
+                    session.close()
+                if not source or not playable_video((folder / source).resolve()):
+                    continue
             self.sessions.addItem(str(folder.relative_to(self.store.root / "sessions")), folder)
         selected = self.sessions.findData(current)
         self.sessions.setCurrentIndex(max(0, selected))

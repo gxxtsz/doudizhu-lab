@@ -123,7 +123,7 @@ def build_main_window(window: "MainWindow") -> None:
     window.action_button.setMinimumHeight(30)
     window.action_button.clicked.connect(window.primary_action)
     task_layout.addWidget(window.action_button)
-    window.stop_button = QPushButton("停止并保存")
+    window.stop_button = QPushButton("停止任务")
     window.stop_button.setObjectName("danger")
     window.stop_button.clicked.connect(window.stop_and_save)
     task_layout.addWidget(window.stop_button)

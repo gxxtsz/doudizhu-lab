@@ -53,7 +53,7 @@ uv run --extra vision ddz-lab --continuous --continuous-policy balanced --biddin
 
 每次选牌后重新定位，提交前两帧核对选中多重集合，命令只提交一次。点击成功不等于游戏接受；手牌变化、自己的出牌和行动转换提供确认。普通确认窗口3秒，炸弹／王炸特效最多5秒。页面短暂漏识别在平衡模式下最多8秒等待证据，期间不重复点击。
 
-停止并保存会锁住后续授权，已经发出的单次命令记为在途，不能撤回。授权不跨重启或跨新任务恢复。
+“停止任务”会锁住后续授权，已经发出的单次命令记为在途，不能撤回。程序异常会固定故障录像并进入后台收尾，不能重新授权继续运行该故障会话；用户需在收尾完成后开始新任务。正常局和主动中止局清理临时录像，详细规则见[记录与回放](recording-and-replay.md)。授权不跨重启或跨新任务恢复。
 
 ```powershell
 uv run ddz-check simulate-continuous --runs 6 --policy balanced --bidding model --require-pass

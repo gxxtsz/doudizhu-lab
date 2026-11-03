@@ -279,6 +279,7 @@ class BotRuntime:
                 pipeline is self.pipeline
                 and pipeline.allowed
                 and not pipeline.stop_event.is_set()
+                and not getattr(pipeline, "failed", False)
                 and newest
                 and newest.version == snapshot.version
                 and not newest.pending
@@ -392,6 +393,7 @@ class BotRuntime:
             self.clock() - self.gate.heartbeat_at > 1.0
             or not pipeline.allowed
             or pipeline.stop_event.is_set()
+            or getattr(pipeline, "failed", False)
         ):
             self.executor.cancel("界面心跳、视频或游戏前台已失效")
             self.status = self.executor.reason

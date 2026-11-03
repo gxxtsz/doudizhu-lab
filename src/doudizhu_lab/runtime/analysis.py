@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from doudizhu_lab.domain.models import Frame
 
@@ -93,7 +93,13 @@ class OrderedAnalyzer:
             if not self.pending:
                 return None
             future = self.pending[0]
-        result = future.result()
+        try:
+            result = future.result(timeout=timeout)
+        except TimeoutError:
+            # 等待超时保留队首，不能跳过它发布后帧。识别函数自身抛出的同类异常仍上抛。
+            if not future.done():
+                return None
+            result = future.result()
         with self.condition:
             self.pending.popleft()
         return result
@@ -104,13 +110,23 @@ class OrderedAnalyzer:
         with self.condition:
             return len(self.pending)
 
+    @property
+    def unfinished(self):
+        """返回仍在运行或等待运行的真实任务数，故障收尾不能将它们误认作已释放资源。"""
+        with self.condition:
+            return sum(not future.done() for future in self.pending)
+
     def close(self):
         """停止接收新任务并唤醒消费者；已接收的任务继续处理，不静默丢弃尾部。"""
         with self.condition:
             self.closed = True
             self.condition.notify_all()
 
-    def shutdown(self):
-        """等待已提交任务收尾；必须在消费者退出或已排空后调用。"""
+    def shutdown(self, *, wait=True):
+        """关闭任务池；正常收尾等待完成，故障路径可不等待阻塞的计算任务。
+
+        wait=False 不会强杀 Python 线程；调用方必须保留故障资料，不能据此声称任务
+        已完成或删除仍可能被工作线程使用的会话资源。
+        """
         self.close()
-        self.executor.shutdown(wait=True, cancel_futures=False)
+        self.executor.shutdown(wait=wait, cancel_futures=not wait)

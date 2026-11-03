@@ -279,6 +279,8 @@ class SegmentWriter:
         self.config = b""
         self.size = (0, 0)
         self.last_check = 0.0
+        # 已清理片段会从索引移除，文件编号必须独立递增，避免覆盖仍被故障局引用的片段。
+        self._segment_sequence = 0
 
     def _index(self):
         """原子发布索引；对 Windows 短暂共享占用最多等待半秒，持续失败仍报告录像中断。"""
@@ -328,7 +330,8 @@ class SegmentWriter:
                 return
             if not self.config or not all(self.size):
                 raise ValueError("录像缺少编码配置或尺寸会话")
-            name = f"segment-{len(self.segments):04d}.mkv"
+            name = f"segment-{self._segment_sequence:04d}.mkv"
+            self._segment_sequence += 1
             self.template_container = av.open(io.BytesIO(self.config + packet.data), format="h264", mode="r")
             self.container = av.open(str(self.folder / name), mode="w", format="matroska")
             self.stream = self.container.add_stream_from_template(self.template_container.streams.video[0])

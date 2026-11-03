@@ -21,6 +21,8 @@ from doudizhu_lab.runtime.continuous import ContinuousProgress, ContinuousRuntim
 from doudizhu_lab.runtime.recording import RecordingPipeline
 from doudizhu_lab.runtime.worker import SerialWorker, Task
 from doudizhu_lab.storage.config import Store
+from doudizhu_lab.storage.retention import RecordingResult, StopReason
+from doudizhu_lab.storage.runs import evaluate_run
 from doudizhu_lab.ui.components import build_main_window
 from doudizhu_lab.ui.lifetime import ensure_gui_lifetime
 from doudizhu_lab.ui.replay import SessionDialog
@@ -33,7 +35,7 @@ TASK_NAMES = {
     "preparing": "正在准备",
     "running": "运行中",
     "paused": "已暂停",
-    "stopping": "正在保存",
+    "stopping": "正在收尾",
     "completed": "已完成",
     "stopped": "已停止",
     "failed": "需要处理",
@@ -269,12 +271,14 @@ class MainWindow(QMainWindow):
         self._startup_action = ""
         self.pause_preview()
         self._requested_action = action
+        self._record_automatic = action == "continuous"
         self._stop_requested = False
         self.task_status, self.message = (
             "preparing",
             "等待当前画面读取完成" if self.busy else "正在准备视频通道",
         )
         self._saved_folder = self._last_progress = None
+        self._recording_result = None
         self._table_state = {}
         self._resume_error = ""
         self._task_started = monotonic()
@@ -286,7 +290,12 @@ class MainWindow(QMainWindow):
 
         模拟子类只替换此工厂。构造失败由 Task 捕获，GUI 展示中文原因。
         """
-        return RecordingPipeline(self.store, serial, acceptance=self.acceptance)
+        return RecordingPipeline(
+            self.store,
+            serial,
+            acceptance=self.acceptance,
+            automatic=getattr(self, "_record_automatic", False),
+        )
 
     def _dispatch_pending(self) -> None:
         """GUI 线程在后台空闲时消费一次意图；停止和关闭优先于刷新及录像启动。"""
@@ -388,7 +397,7 @@ class MainWindow(QMainWindow):
         if not self._stop_requested:
             self._finish_status = outcome
             self.message = reason
-            self.log(reason + "；正在保存录像")
+            self.log(reason + "；正在收尾录像")
         self._stop_requested = True
         self.task_status = "stopping"
         self._dispatch_pending()
@@ -398,16 +407,32 @@ class MainWindow(QMainWindow):
         """由 GUI 线程提交一次后台收尾；先关闭连续账本，再停止视频并关闭会话。"""
         pipeline, continuous = self.recording, self.continuous
         self._record_stopping = True
+        run_folder = getattr(getattr(continuous, "store", None), "folder", None)
+        reason = {"completed": StopReason.COMPLETED, "failed": StopReason.FAULT}.get(
+            self._finish_status, StopReason.USER
+        )
 
         def save():
             try:
                 if continuous:
                     continuous.close()
+            except Exception as exc:
+                if hasattr(pipeline, "report_failure"):
+                    pipeline.report_failure("continuous_shutdown", f"连续任务收尾失败：{exc}")
+                raise
             finally:
                 try:
-                    pipeline.stop()
+                    if hasattr(pipeline, "finalize_recording"):
+                        pipeline.stop(reason)
+                    else:
+                        pipeline.stop()
                 finally:
                     pipeline.session.close()
+            if hasattr(pipeline, "finalize_recording"):
+                result = pipeline.finalize_recording()
+                if isinstance(run_folder, Path):
+                    evaluate_run(run_folder)
+                return result
             return pipeline.session.folder
 
         self._submit("record_stop", save)
@@ -418,7 +443,17 @@ class MainWindow(QMainWindow):
         self._requested_action = ""
         self.task_status = self._finish_status
         if self._saved_folder:
+            if getattr(self, "_recording_result", None) and self._recording_result.reason == StopReason.FAULT:
+                self.message = "异常录像及诊断资料已保留，可打开本次回放"
             self.log("录像已保存，可打开本次回放")
+        elif getattr(self, "_recording_result", None):
+            result = self._recording_result
+            self.message = (
+                "故障资料已保存；本次未取得可播放录像"
+                if result.reason == StopReason.FAULT
+                else "本次临时录像已清理，运行摘要已保存"
+            )
+            self.log(self.message)
         if self.auto_preview and not self._exit_requested:
             self.start_preview()
 
@@ -477,7 +512,13 @@ class MainWindow(QMainWindow):
             if not self._stop_requested and not self._exit_requested:
                 QTimer.singleShot(0, self._launch_continuous)
         elif kind == "record_stop":
-            self._saved_folder = Path(value)
+            if isinstance(value, RecordingResult):
+                self._recording_result = value
+                self._saved_folder = value.replay_folder
+                if value.reason == StopReason.FAULT:
+                    self._finish_status = "failed"
+            else:
+                self._saved_folder = Path(value)
             self.recording = None
             self.continuous = None
             if self.bot:
@@ -681,7 +722,7 @@ class MainWindow(QMainWindow):
             elif status == "idle":
                 notice = "准备就绪，点击开始即可自动匹配并连续游戏"
             elif status == "running":
-                notice = "自动匹配、叫抢与出牌；录像同步保存在本机"
+                notice = "自动匹配、叫抢与出牌；正常局清理录像，异常局保留诊断资料"
         return DashboardState(
             status=status,
             model_state=model.state,
@@ -829,7 +870,11 @@ class MainWindow(QMainWindow):
             self.start_preview()
 
     def closeEvent(self, event) -> None:
-        """关闭先减权，再等待后台录像收尾；加载中的模型也只清理本实例，不触碰其他进程。"""
+        """关闭先减权，再等待后台录像收尾；加载中的模型也只清理本实例。
+
+        后台已报告的收尾故障不能再次越过Qt回调边界。保留原故障资料和错误信息，
+        仍继续关闭本窗口的模型、定时器及执行器，不触碰其他进程。
+        """
         if self._closing:
             event.accept()
             return
@@ -841,7 +886,10 @@ class MainWindow(QMainWindow):
             return
         self._closing = True
         if self.continuous:
-            self.continuous.close()
+            try:
+                self.continuous.close()
+            except Exception as exc:
+                self.log(f"连续任务收尾失败，故障资料已保留：{exc}")
         if self.bot:
             self.bot.close()
         self.timer.stop()

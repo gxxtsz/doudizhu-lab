@@ -19,6 +19,8 @@
 
 编码媒体源通过`VideoSource`协议注入。原速回放不创建ADB或输入客户端，不需要手机服务器；它发布的画面transport为replay，真实输入闸门会拒绝。真机流水线仍必须通过固定scrcpy服务器校验。历史审计使用`SessionStore(..., readonly=True)`，不会创建表或修改数据库模式。
 
+真机采集使用`CaptureProcess`启动独立录像进程，完整编码包先写入分段MKV，再通过有界通道发布分析副本。健康报告与处置命令独立于视频管道和SQLite；主程序阻塞或退出时，录像进程仍能固定故障、尾录和封口。`StopReason`区分用户中止、正常完成和故障，`RecordingResult`返回摘要及实际回放路径。自动会话先停止处理并关闭数据库，再由留存账本清理正常资料；故障、正式验收和显式录像保留复现所需内容。
+
 主要数据流：视频帧 → 同帧观察 → 跟踪与运行状态 → 不可变决策快照 → 模型决策 → 逐次选牌／核对／提交 → 新画面确认。意图、输入返回、确认事件分别记账。
 
 公共Python接口从`domain`导出`Frame`、`TableObservation`、`GameState`、`GameEvent`、`GameTracker`、`ObservationSnapshot`、`Decision`和`Profile`。旧`ddz_device.*`内部导入已移除，命令行入口保留兼容。

@@ -85,6 +85,11 @@ class VideoReplay:
                 None,
             )
             if segment is None:
+                retention = self.folder / "留存记录.json"
+                if retention.exists():
+                    value = json.loads(retention.read_text(encoding="utf-8"))
+                    if any(s["start_us"] <= pts_us <= s["end_us"] for s in value.get("removed_segments", [])):
+                        raise ValueError("该时间录像已按正常完成或主动中止策略清理")
                 raise ValueError("该时间没有录像，可能处于传输或前台切换缺口")
         with av.open(str(self.video / segment["file"])) as container:
             stream = container.streams.video[0]

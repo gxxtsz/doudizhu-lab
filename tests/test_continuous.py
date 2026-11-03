@@ -330,6 +330,31 @@ def test_stop_does_not_wait_for_inflight_usb_command(run, monkeypatch):
     assert not thread.is_alive() and run.runtime.status == "stopped"
 
 
+def test_fault_report_rejects_page_input_at_the_last_guard(run, monkeypatch):
+    """故障发生在本轮状态检查之后时，发送前的最终检查仍须拒绝页面操作。"""
+    original = run.gate.tap
+
+    def fail_before_tap(*args, **kwargs):
+        run.pipeline.failed = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run.gate, "tap", fail_before_tap)
+    run.tick(2)
+    assert not run.pipeline.flow_commands
+    assert run.runtime.status == "paused" and run.gate.owner is None
+
+
+def test_fault_report_rejects_card_input_and_revokes_bot_mode(run):
+    """尾录期间视频和心跳继续正常，故障标记仍须独立阻止出牌。"""
+    playing(run)
+    run.pipeline.failed = True
+    before = sum(device.taps for device in run.pipeline.devices)
+    run.gate.heartbeat()
+    run.bot.pulse()
+    assert run.bot.mode == "stop" and run.gate.owner is None
+    assert sum(device.taps for device in run.pipeline.devices) == before
+
+
 @pytest.mark.parametrize("kind", ["stream", "orientation", "device"])
 def test_source_changes_revoke_future_input(run, kind):
     run.tick()

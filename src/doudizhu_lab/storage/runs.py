@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from collections import Counter
+from contextlib import closing
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -171,7 +172,7 @@ def verify_inference(event, before, observations):
 def evaluate_run(folder, *, output=None):
     """只读评测任务；模拟结果单独标记，实时完成还要求录像正常收尾及无采集缺口。"""
     folder = Path(folder)
-    with sqlite3.connect((folder / "run.sqlite3").resolve().as_uri() + "?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect((folder / "run.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as db:
         meta = {k: json.loads(v) for k, v in db.execute("SELECT key,payload FROM meta")}
         journal = [(k, json.loads(v)) for k, v in db.execute("SELECT kind,payload FROM journal ORDER BY seq")]
         flow_frames = {
@@ -217,6 +218,13 @@ def evaluate_run(folder, *, output=None):
     manual = [v for k, v in journal if k == "manual_takeover"]
     simulation = meta["source"] == "simulation_continuous"
     session = Path(meta["session"])
+    summary_path = folder.parent.parent / "recording-summaries" / f"{session.name}.json"
+    retention_path = session / "留存记录.json"
+    retention = {}
+    for path in (summary_path, retention_path):
+        if path.is_file():
+            retention.update(json.loads(path.read_text(encoding="utf-8")))
+    policy_cleaned = retention.get("media_status") == "cleaned" or bool(retention.get("removed_segments"))
     video_closed, capture_issues, submissions, illegal = simulation, [], [], []
     game_audits = []
     policy = meta.get("profile", {}).get("continuous_policy", "strict")
@@ -224,7 +232,7 @@ def evaluate_run(folder, *, output=None):
     inference_errors = []
     db_path = session / "session.sqlite3"
     if db_path.exists():
-        with sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             actions = [json.loads(v[0]) for v in db.execute("SELECT payload FROM bot_actions ORDER BY seq")]
             all_issues = [json.loads(v[0]) for v in db.execute("SELECT payload FROM issues")]
             events = [json.loads(v[0]) for v in db.execute("SELECT payload FROM events ORDER BY seq")]
@@ -351,8 +359,14 @@ def evaluate_run(folder, *, output=None):
             data = json.loads(index.read_text(encoding="utf8"))
             segments = data.get("segments", []) if isinstance(data, dict) else data
             video_closed = bool(segments) and all(v.get("closed") for v in segments)
+            # 仅用已登记清理范围解释对应缺口；同会话其他区间仍须检查真实采集丢失。
+            coverage = segments + [
+                {"global_start_us": s["start_us"], "global_end_us": s["end_us"]}
+                for s in retention.get("removed_segments", [])
+            ]
             for game in games:
-                for left, right in uncovered_video_intervals(segments, game["start_us"], game["end_us"]):
+                missing = uncovered_video_intervals(coverage, game["start_us"], game["end_us"])
+                for left, right in missing:
                     capture_issues.append(
                         {
                             "code": "video_coverage",
@@ -380,6 +394,7 @@ def evaluate_run(folder, *, output=None):
         and not inference_errors
         and not bidding_errors
         and video_closed
+        and not policy_cleaned
         and len(game_audits) == len(games)
         and all(g["passed"] for g in game_audits)
     )
@@ -396,6 +411,11 @@ def evaluate_run(folder, *, output=None):
         "inferred_events": sum(e.get("source") == "operational_inferred" for e in operational_events),
         "inference_proof_errors": inference_errors,
         "completed_games": len(games),
+        "tracking_completed_games": max(
+            len(games), sum(w.get("outcome") == "completed" for w in retention.get("windows", []))
+        ),
+        "media_status": "policy_cleaned" if policy_cleaned else "retained",
+        "video_audit_available": video_closed and not policy_cleaned,
         "required_games": required_games,
         "transitions": max(0, len(games) - 1),
         "games": games,

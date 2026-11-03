@@ -136,7 +136,9 @@ def test_production_analysis_saves_ordinary_turn_ocr_without_winner_marker(tmp_p
     pipeline = RecordingPipeline(Store(tmp_path), "test")
     pipeline.analysis_pool.shutdown()
     results = iter([(frame, (observation, recognition)), None])
-    pipeline.analysis_pool = SimpleNamespace(take=lambda: next(results), closed=True, shutdown=lambda: None)
+    pipeline.analysis_pool = SimpleNamespace(
+        take=lambda: next(results), closed=True, size=0, shutdown=lambda **kwargs: None
+    )
     pipeline.evidence = SimpleNamespace(submit=lambda *a: True)
     pipeline._last_card_enabled = True
     try:

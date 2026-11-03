@@ -112,6 +112,8 @@ class ContinuousRuntime:
             if self.status != "idle":
                 raise ValueError("任务已创建；暂停后请明确恢复，重新运行请创建新任务")
             self.store = RunStore.create(self.root, self.pipeline)
+            if hasattr(self.pipeline, "enable_automatic_retention"):
+                self.pipeline.enable_automatic_retention()
             self.status, self.started = "running", self.clock()
             self.scene_since = self.last_new_at = self.started
             self.bot.attach(self.pipeline)
@@ -136,13 +138,23 @@ class ContinuousRuntime:
 
     def _run(self):
         try:
+            if hasattr(self.pipeline, "stage_started"):
+                self.pipeline.stage_started("流程识别初始化")
             self.pipeline.enable_flow()
+            if hasattr(self.pipeline, "stage_finished"):
+                self.pipeline.stage_finished("流程识别初始化")
             while not self.stop_event.wait(0.04):
                 self.poll_stop_request()
                 if self.stop_event.is_set():
                     break
                 if self.active:
-                    self.advance(self.pipeline.flow_snapshot(), self.pipeline.bot_snapshot())
+                    if hasattr(self.pipeline, "stage_started"):
+                        self.pipeline.stage_started("连续流程处理")
+                    try:
+                        self.advance(self.pipeline.flow_snapshot(), self.pipeline.bot_snapshot())
+                    finally:
+                        if hasattr(self.pipeline, "stage_finished"):
+                            self.pipeline.stage_finished("连续流程处理")
         except Exception as exc:
             self.pause(f"连续任务异常：{exc}")
         finally:
@@ -164,13 +176,21 @@ class ContinuousRuntime:
             self.stop_recording_requested = True
             self.stop("命令行请求停止连续任务")
 
-    def pause(self, reason):
-        """立即撤销流程及出牌授权；暂停原因与在途动作保留，不能自动进入下一局。"""
+    def pause(self, reason, *, manual=False):
+        """立即撤销流程及出牌授权；系统暂停固定故障，显式用户暂停清理当前窗口。
+
+        manual为原因类型，不通过中文文案推断。任何此前已固定故障优先保留，恢复
+        仍须原有可信状态检查；本接口不隐式授权新一局。
+        """
         with self.lock:
             if self.status != "running":
                 return
             self.gate.revoke()
             self.bot.set_mode("stop")
+            if manual and hasattr(self.pipeline, "abort_recording_window"):
+                self.pipeline.abort_recording_window()
+            elif not manual and hasattr(self.pipeline, "report_failure"):
+                self.pipeline.report_failure("continuous_pause", reason)
             self.status, self.reason = "paused", reason
             self.store.set("status", self.status)
             self.store.add("paused", reason=reason, game_id=self.current_game, at=self.clock())
@@ -206,6 +226,8 @@ class ContinuousRuntime:
         with self.lock:
             if self.status != "paused":
                 raise ValueError("当前任务不是暂停状态")
+            if getattr(self.pipeline, "failed", False):
+                raise ValueError("已发生程序异常，正在保存故障资料；请收尾后开始新任务")
             flow, snapshot = self.pipeline.flow_snapshot(), self.pipeline.bot_snapshot()
             if (
                 not flow
@@ -282,7 +304,11 @@ class ContinuousRuntime:
                     self.store.observation(flow)
                     self.pause(flow.blocked_reason)
                     return
-            if now - self.gate.heartbeat_at > 1 or self.pipeline.stop_event.is_set():
+            if (
+                now - self.gate.heartbeat_at > 1
+                or self.pipeline.stop_event.is_set()
+                or getattr(self.pipeline, "failed", False)
+            ):
                 self.pause("界面心跳或视频已中断")
                 return
             if not self.pipeline.allowed:
@@ -560,6 +586,7 @@ class ContinuousRuntime:
                 self.active
                 and self.pipeline.allowed
                 and not self.pipeline.stop_event.is_set()
+                and not getattr(self.pipeline, "failed", False)
                 and newest
                 and newest.scene == flow.scene
                 and (
@@ -720,5 +747,7 @@ class ContinuousRuntime:
         )
         self.registered.add(self.current_game)
         self.completed.append(self.current_game)
+        if hasattr(self.pipeline, "complete_game"):
+            self.pipeline.complete_game(self.current_game, snapshot.frame.media_pts_us)
         self.bot.set_mode("suggest")
         return True
