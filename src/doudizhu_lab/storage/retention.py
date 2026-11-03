@@ -124,16 +124,30 @@ class RetentionLedger:
 
     def complete_game(self, game_id: str, pts_us: int) -> None:
         """确认正常跟踪至结算；重复或迟到的结算不推进清理边界，也不覆盖故障。"""
-        if any(w["game_id"] == game_id and w["outcome"] == "completed" for w in self.windows):
+        if any(w["game_id"] == game_id and w["outcome"] in ("completed", "skipped") for w in self.windows):
             return
         if pts_us < self.active["start_us"]:
             return
         if self.faults:
             return
-        self.windows.append(dict(self.active, game_id=game_id, end_us=pts_us, outcome="completed"))
+        outcome = "skipped" if self.active.get("anomalies") else "completed"
+        self.windows.append(dict(self.active, game_id=game_id, end_us=pts_us, outcome=outcome))
         self.frontier = pts_us
         self.active = {"game_id": "", "start_us": pts_us, "end_us": None}
         self.persist()
+
+    def pin_game(self, game_id: str, code: str, message: str) -> None:
+        """固定当前异常局窗口而不触发进程尾录；同类故障只记录一次，不阻止后续正常局。"""
+        self.active["game_id"] = game_id or self.active["game_id"]
+        anomalies = self.active.setdefault("anomalies", [])
+        if not any(a["code"] == code for a in anomalies):
+            anomalies.append({"code": code, "message": message, "pts_us": self.last_pts})
+            self.persist()
+
+    def skip_game(self, game_id: str, pts_us: int) -> None:
+        """仅在可信页面边界关闭已固定窗口；不宣称原历史完整，重复边界不产生新窗口。"""
+        if self.active.get("anomalies"):
+            self.complete_game(game_id, pts_us)
 
     def fault(self, code: str, message: str, *, health=None, occurred_at: float | None = None) -> bool:
         """固定当前窗口并登记同类首个故障；返回是否新增，不延长外层尾录截止时间。
@@ -188,6 +202,12 @@ class RetentionLedger:
             if s.closed
             and s.global_end_us < self.frontier
             and (not self.faults or s.global_end_us < self.active["start_us"])
+            and not any(
+                w.get("anomalies")
+                and s.global_end_us >= w["start_us"]
+                and s.global_start_us <= (w.get("end_us") if w.get("end_us") is not None else self.last_pts)
+                for w in [*self.windows, self.active]
+            )
         ]
         if not candidates:
             return
@@ -225,7 +245,8 @@ def finalize_retention(folder: Path, root: Path, *, runtime: dict | None = None)
     if runtime is not None:
         value["runtime"] = runtime
     reason = StopReason.FAULT if value.get("faults") else StopReason(value.get("reason") or StopReason.FAULT)
-    discard = value.get("automatic") and reason != StopReason.FAULT and not value.get("faults")
+    pinned = any(w.get("anomalies") for w in [*value.get("windows", []), value.get("active", {})])
+    discard = value.get("automatic") and reason != StopReason.FAULT and not value.get("faults") and not pinned
     summary.parent.mkdir(parents=True, exist_ok=True)
     atomic_json(
         summary,

@@ -12,7 +12,7 @@ from doudizhu_lab import __version__
 from doudizhu_lab.cli.console import configure_console
 from doudizhu_lab.domain.settings import PLAY_MODEL_NAMES, parse_max_games
 from doudizhu_lab.storage.config import Store
-from doudizhu_lab.ui.window import MainWindow
+from doudizhu_lab.ui.unattended import create_main_window as MainWindow
 
 
 def _positive_games(text: str) -> int:

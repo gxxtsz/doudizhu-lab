@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from doudizhu_lab.agents.bidding import BidAgent, BiddingController, decision_dict, verify_bid_model
 from doudizhu_lab.devices.adb import InputRejected
+from doudizhu_lab.runtime.faults import FaultScope, RuntimeFault
 from doudizhu_lab.storage.runs import RunStore, evaluate_run
 from doudizhu_lab.vision.flow import SCENE_NAMES
 
@@ -22,6 +23,8 @@ class ContinuousProgress:
     startup_phase 为 waiting_lobby 时等待大厅或结算续局入口，该取值保留旧接口兼容。
     大厅按钮稳定或结算续局提交得到页面反馈后才进入 ready 并授权新局流程；默认
     ready 兼容旧调用。等待仍属于 running，GUI 保留停止按钮。
+    skipped 为异常跳过局数，retries 为工作会话恢复次数，retry_at 为下次自动检查的
+    单调时钟时间或 None；这些展示字段不会恢复历史执行授权。
     """
 
     status: str
@@ -31,19 +34,42 @@ class ContinuousProgress:
     total: int
     elapsed: float
     startup_phase: str = "ready"
+    skipped: int = 0
+    retries: int = 0
+    retry_at: float | None = None
 
 
 class ContinuousRuntime:
-    """一次显式启动对应一个连续任务；支持注入时钟及无后台线程的确定性模拟。
+    """一个执行会话的连续流程；支持注入时钟及无后台线程的确定性模拟。
 
     pipeline 必须已录制，并提供同帧 flow_snapshot/bot_snapshot；bot 是生产单局协调器。
     start 不授予跨重启权限。暂停只撤销后续输入；已发命令保留在途记录，不能撤回。
     lobby_confirmed 仅记录本任务观察过有效大厅按钮，startup_entry 记录首次确认的新局
     入口。结算续局须收到页面推进反馈后才授权下一局；不读取旧 mode_verified 字段，
     不按玩法名称或场次等级授权；完整开局、稳定帧和提交确认仍由生产流程校验。
+    unattended 会话由父任务看护器管理；替代进程创建新会话，累计进度由父账本保存。
     """
 
-    def __init__(self, root, gate, bot, pipeline, *, clock=monotonic, threaded=True, bid_agent=None):
+    def __init__(
+        self,
+        root,
+        gate,
+        bot,
+        pipeline,
+        *,
+        clock=monotonic,
+        threaded=True,
+        bid_agent=None,
+        unattended=False,
+        commit=None,
+        blocked_flow=None,
+    ):
+        """创建单次执行会话；unattended 由任务看护器显式启用。
+
+        commit 在流程线程同步确认父任务账本落盘，失败时不得继续匹配；blocked_flow
+        为前一个执行进程未确认的页面命令，只能观察页面推进后归档，不能重发。
+        旧调用默认保留显式暂停行为，模拟与离线校验不隐式授予无人值守权限。
+        """
         self.root, self.gate, self.bot, self.pipeline = root, gate, bot, pipeline
         self.clock, self.threaded = clock, threaded
         self.lock, self.stop_event = RLock(), Event()
@@ -74,6 +100,12 @@ class ContinuousRuntime:
         self.bid_decision, self.bid_description = None, ""
         self._stop_intent = None
         self._progress_cache = ContinuousProgress("idle", "unknown", "", 0, self.settings["max_games"], 0)
+        self.unattended, self.commit = unattended, commit
+        self.fault = None
+        self.quarantined = False
+        self.skipped = set()
+        self.blocked_flow = blocked_flow
+        self._boundary_probe = None
 
     @property
     def active(self):
@@ -105,6 +137,7 @@ class ContinuousRuntime:
                 self.settings["max_games"],
                 max(0, self.clock() - self.started),
                 self.startup_phase,
+                len(self.skipped),
             )
             return self._progress_cache
         finally:
@@ -199,14 +232,28 @@ class ContinuousRuntime:
             self.stop_recording_requested = True
             self.stop("命令行请求停止连续任务")
 
-    def pause(self, reason, *, manual=False):
+    def pause(self, reason, *, manual=False, scope=FaultScope.SESSION, code="runtime_failure"):
         """立即撤销流程及出牌授权；系统暂停固定故障，显式用户暂停清理当前窗口。
 
         manual为原因类型，不通过中文文案推断。任何此前已固定故障优先保留，恢复
         仍须原有可信状态检查；本接口不隐式授权新一局。
+        unattended 下非人工故障按 scope 分流：ROUND 隔离本局并继续观察，SESSION
+        请求父进程重建，EXTERNAL 请求只读探测；code 为稳定故障代码，不解析 reason。
         """
         with self.lock:
             if self.status != "running":
+                return
+            if self.unattended and not manual:
+                self.gate.revoke()
+                self.bot.set_mode("stop")
+                if scope == FaultScope.ROUND:
+                    self._skip_round(code, reason)
+                    return
+                self.fault = RuntimeFault(code, reason, scope)
+                self.status = "waiting_external" if scope == FaultScope.EXTERNAL else "recovering"
+                self.reason = reason
+                self.store.set("status", self.status)
+                self.store.add("recovery_needed", code=code, scope=scope, reason=reason)
                 return
             self.gate.revoke()
             self.bot.set_mode("stop")
@@ -219,6 +266,60 @@ class ContinuousRuntime:
             self.store.add("paused", reason=reason, game_id=self.current_game, at=self.clock())
             if self.last_flow:
                 self.pipeline.evidence.submit(self.last_flow.frame, ["continuous-pause"])
+
+    def _commit(self, event_kind, **value):
+        """先写入执行账本，再等待父任务持久确认；本接口不直接发送设备输入。"""
+        self.store.add(event_kind, **value)
+        if self.commit:
+            self.commit(event_kind, value)
+
+    def _skip_round(self, code, reason):
+        """隔离一次异常牌局并固定录像；重复观察只登记一次，保持流程观察线程运行。"""
+        if not self.quarantined:
+            self._boundary_probe = None
+        self.quarantined = True
+        self.reason = reason + "；等待明确结算后自动续局"
+        game = self.current_game or self._seen_deal
+        if not game or game in self.skipped:
+            return
+        self.skipped.add(game)
+        pts = self.last_flow.frame.media_pts_us if self.last_flow else 0
+        if hasattr(self.pipeline, "pin_game"):
+            self.pipeline.pin_game(game, code, reason, pts)
+        self._commit("game_skipped", game_id=game, code=code, reason=reason, pts_us=pts)
+
+    def _quarantine_boundary(self, flow):
+        """仅以新鲜双帧终局入口结束隔离；动画、未知画面及旧局跟踪缺口不是边界。"""
+        reliable = (
+            flow.scene in ("lobby", "room")
+            and any(b.kind == "match" and b.enabled for b in flow.buttons)
+            or flow.scene in ("settlement", "showcase")
+            and any(
+                b.enabled
+                and (
+                    b.kind in ("continue", "close_showcase")
+                    or b.kind == "return_lobby"
+                    and b.label == "返回大厅"
+                )
+                for b in flow.buttons
+            )
+        )
+        if not reliable:
+            self._boundary_probe = None
+            return False
+        if not self._boundary_probe or self._boundary_probe[0] != flow.scene:
+            self._boundary_probe = flow.scene, flow.frame.media_pts_us
+            return False
+        if flow.frame.media_pts_us - self._boundary_probe[1] < 100_000:
+            return False
+        self.bot.executor.cancel("异常局已明确结束，保留原提交结果")
+        if hasattr(self.pipeline, "finish_skipped_game"):
+            self.pipeline.finish_skipped_game(self.current_game or self._seen_deal, flow.frame.media_pts_us)
+        self._commit("round_boundary", game_id=self.current_game or self._seen_deal)
+        self.current_game = self.armed_game = ""
+        self.quarantined = False
+        self.reason = "上一局异常已跳过，正在继续"
+        return True
 
     def request_stop(self, reason: str = "用户停止连续任务", *, manual: bool = True) -> None:
         """GUI 的非阻塞停止意图；立即减权并停止循环，正式账本由后台 close/stop 收尾。
@@ -315,7 +416,7 @@ class ContinuousRuntime:
             self.lobby_confirmed = True
         self.store.set("startup_phase", self.startup_phase)
         self.store.set("startup_entry", entry)
-        self.store.add(
+        self._commit(
             "startup_wait_finished",
             entry=entry,
             frame_id=flow.frame.frame_id,
@@ -399,7 +500,7 @@ class ContinuousRuntime:
                 )
                 if self.identity is None or blocked_identity == self.identity:
                     self.store.observation(flow)
-                    self.pause(flow.blocked_reason)
+                    self.pause(flow.blocked_reason, scope=FaultScope.EXTERNAL, code="blocked_page")
                     return
             if (
                 now - self.gate.heartbeat_at > 1
@@ -410,7 +511,7 @@ class ContinuousRuntime:
                 return
             if not self.pipeline.allowed:
                 if self.identity is not None or now - self._ready_since > 20:
-                    self.pause("游戏前台或设备状态失效")
+                    self.pause("游戏前台或设备状态失效", scope=FaultScope.EXTERNAL, code="foreground")
                 return
             recording = getattr(self.pipeline, "record_ready", None)
             if recording is not None and not recording.is_set():
@@ -444,21 +545,22 @@ class ContinuousRuntime:
                     self._seen_deal = deal
                     self.scene_epoch += 1
                     self.candidate = None
-                    self.store.add(
+                    self._commit(
                         "deal_attempt",
                         game_id=deal,
                         frame_id=flow.frame.frame_id,
                         pts_us=flow.frame.media_pts_us,
                     )
             if flow.blocked_reason:
-                self.pause(flow.blocked_reason)
+                self.pause(flow.blocked_reason, scope=FaultScope.EXTERNAL, code="blocked_page")
                 return
             if (
                 snapshot
+                and not self.quarantined
                 and self.armed_game == snapshot.state["game_id"]
                 and (snapshot.state["pending"] or snapshot.state["capture_incomplete"])
             ):
-                self.pause("本局出现真实历史缺口或矛盾")
+                self.pause("本局出现真实历史缺口或矛盾", scope=FaultScope.ROUND, code="history_gap")
                 return
             if flow.scene != self.scene:
                 self.scene, self.scene_since = flow.scene, now
@@ -470,6 +572,16 @@ class ContinuousRuntime:
                     "scene", scene=flow.scene, frame_id=flow.frame.frame_id, pts_us=flow.frame.media_pts_us
                 )
                 self.pipeline.evidence.submit(flow.frame, [f"flow-{flow.scene}"])
+            if self.blocked_flow:
+                # 跨执行进程的旧命令永不补发；明确离开原页面后只归档未知结果，不补造确认。
+                if flow.scene in ("unknown", self.blocked_flow["origin_scene"]):
+                    self.reason = "旧页面命令结果未知，正在等待页面自然推进"
+                    return
+                self._commit("flow_retired", action_id=self.blocked_flow["action_id"], scene=flow.scene)
+                self.blocked_flow = None
+            if self.quarantined:
+                if not self._quarantine_boundary(flow):
+                    return
             if self.pending_flow:
                 pending = self.pending_flow
                 # 平衡模式在旧按钮已消失时优先继续取证，最多8秒；仅消失并不等于成功。
@@ -512,7 +624,7 @@ class ContinuousRuntime:
                     elif pending.get("absent_us") is None:
                         pending["absent_us"] = flow.frame.media_pts_us
                     if flow.frame.media_pts_us - pending["absent_us"] >= 100_000:
-                        self.store.add(
+                        self._commit(
                             "flow_confirmed",
                             action_id=pending["action_id"],
                             frame_id=flow.frame.frame_id,
@@ -546,17 +658,21 @@ class ContinuousRuntime:
                             deadline_seconds=8,
                         )
                     if now - pending["sent_at"] > (8 if wait_for_evidence else 3):
-                        self.pause("页面操作在证据等待窗口内仍无法唯一确认，禁止重复点击")
+                        self.pause(
+                            "页面操作在证据等待窗口内仍无法唯一确认，禁止重复点击",
+                            scope=FaultScope.EXTERNAL,
+                            code="unknown_flow",
+                        )
                     return
             if self._wait_for_entry(flow):
                 return
             if flow.scene == "unknown":
                 if now - self.scene_since > 5:
-                    self.pause("未知页面持续五秒")
+                    self.pause("未知页面持续五秒", scope=FaultScope.EXTERNAL, code="unknown_page")
                 return
             if flow.scene == "matching":
                 if now - self.scene_since > 120:
-                    self.pause("匹配等待超过120秒")
+                    self.pause("匹配等待超过120秒", scope=FaultScope.EXTERNAL, code="matching_timeout")
                 return
             if flow.scene == "playing":
                 if not self.entry_confirmed:
@@ -565,7 +681,11 @@ class ContinuousRuntime:
                 self._playing(snapshot)
                 return
             if flow.scene == "ending" and now - self.scene_since > 10:
-                self.pause("结算已确认，但十秒内没有出现可确认的结算按钮")
+                self.pause(
+                    "结算已确认，但十秒内没有出现可确认的结算按钮",
+                    scope=FaultScope.ROUND,
+                    code="ending_timeout",
+                )
                 return
             if flow.scene in ("settlement", "showcase", "ending"):
                 if not self._settlement(snapshot):
@@ -683,7 +803,7 @@ class ContinuousRuntime:
             record.update(bidding=decision_dict(bidding), bid_deal=bid_deal)
         self.pending_flow = record.copy()
         self.sent_opportunities.add(opportunity)
-        self.store.add("flow_sent", **record)
+        self._commit("flow_sent", **record)
         self.pipeline.evidence.submit(flow.frame, [action_id])
 
         def guard():
@@ -732,13 +852,13 @@ class ContinuousRuntime:
             )
             self.store.add("flow_returned", action_id=action_id, at=self.clock())
         except InputRejected as exc:
-            self.store.add("flow_not_sent", action_id=action_id, message=str(exc))
+            self._commit("flow_not_sent", action_id=action_id, message=str(exc))
             self.pending_flow = None
             self.sent_opportunities.discard(opportunity)
             self.pause(f"页面输入未发送：{exc}")
         except Exception as exc:
             self.store.add("flow_unknown", action_id=action_id, message=str(exc))
-            self.pause(f"页面命令结果未知：{exc}")
+            self.pause(f"页面命令结果未知：{exc}", scope=FaultScope.EXTERNAL, code="unknown_flow")
         finally:
             self.lock.acquire()
 
@@ -748,22 +868,33 @@ class ContinuousRuntime:
         state = snapshot.state
         if state["ended"] or state["phase"] != "playing":
             return
+        if self.unattended and self.armed_game != state["game_id"]:
+            # 新局即使未达到出牌授权条件，也必须有独立异常编号，不能误固定上一局录像。
+            self.current_game = state["game_id"]
         if state["pending"] or state["capture_incomplete"]:
-            self.pause("出牌前发现历史缺口，不能用猜测状态启动")
+            self.pause("出牌前发现历史缺口，不能用猜测状态启动", scope=FaultScope.ROUND, code="history_gap")
             return
         if self.armed_game == state["game_id"]:
             if self.bot.mode == "stop":
-                self.pause(self.bot.pause_reason or self.bot.executor.reason or self.bot.status)
+                self.pause(
+                    self.bot.pause_reason or self.bot.executor.reason or self.bot.status,
+                    scope=FaultScope.ROUND,
+                    code="bot_round_halted",
+                )
             return
         if not state["landlord"] or not state["bottom"] or not state["initial_hand"]:
             # 新旧局切换的跟踪候选可能早于稳定的身份/底牌快照；先等待取证，不猜底牌。
             startup_wait = 8 if self.pipeline.profile.continuous_policy != "strict" else 3
             if self.clock() - self.scene_since > startup_wait:
-                self.pause("开局取证窗口结束后身份、底牌或手牌仍不完整")
+                self.pause(
+                    "开局取证窗口结束后身份、底牌或手牌仍不完整",
+                    scope=FaultScope.ROUND,
+                    code="incomplete_setup",
+                )
             return
         self.current_game = self.armed_game = state["game_id"]
         self._finish_wait = None
-        self.store.add(
+        self._commit(
             "game_armed",
             game_id=self.current_game,
             frame_id=snapshot.frame.frame_id,
@@ -784,7 +915,7 @@ class ContinuousRuntime:
             or self.bot.executor.active
         ):
             if self.clock() - self._finish_wait > 3:
-                self.pause("结算后末手或牌局边界无法确认")
+                self.pause("结算后末手或牌局边界无法确认", scope=FaultScope.ROUND, code="incomplete_end")
             return False
         state = snapshot.state
         actions = self.pipeline.session.rows("bot_actions")
@@ -829,12 +960,16 @@ class ContinuousRuntime:
             )
         if not verified:
             if self.clock() - self._finish_wait > 3:
-                self.pause("本局存在未确认出牌、托管或不完整历史，不能计为机器人完成")
+                self.pause(
+                    "本局存在未确认出牌、托管或不完整历史，不能计为机器人完成",
+                    scope=FaultScope.ROUND,
+                    code="unverified_game",
+                )
             return False
         start = next(
             (e["pts_us"] for e in snapshot.history if e["kind"] == "game_start"), snapshot.frame.media_pts_us
         )
-        self.store.add(
+        self._commit(
             "game_complete",
             game_id=self.current_game,
             start_us=start,

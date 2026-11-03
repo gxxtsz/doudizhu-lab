@@ -21,11 +21,13 @@ class InputGate:
     已跨过闸门的一个命令属于在途，不能承诺撤回。
     """
 
-    def __init__(self, *, clock=monotonic, transport="video"):
+    def __init__(self, *, clock=monotonic, transport="video", lease=lambda: True):
         if transport not in ("video", "simulation"):
             raise ValueError("输入通道只支持实时视频或隔离模拟器")
         self.transport = transport
         self.clock = clock
+        # 进程租约由父进程持有；撤销或父界面失联后，后台不能重新授予输入。
+        self.lease = lease
         self.lock = threading.RLock()
         self.serial = threading.Lock()
         self.generation = 0
@@ -37,7 +39,7 @@ class InputGate:
         """授予单一输入所有者，旧所有者的授权同时作废。"""
         with self.lock:
             self.generation += 1
-            self.owner = None if self.blocked else owner
+            self.owner = None if self.blocked or not self.lease() else owner
             return self.generation
 
     def revoke(self):
@@ -52,7 +54,7 @@ class InputGate:
             self.owner = None
 
     def allow(self) -> None:
-        """仅供用户显式开始或恢复时解除停止锁；解除本身不授予所有者，也不发送输入。"""
+        """显式任务或同任务有效父租约下解除停止锁；解除本身不授予所有者，也不发送输入。"""
         with self.lock:
             self.blocked = False
             self.generation += 1
@@ -66,7 +68,7 @@ class InputGate:
         """串行发送一个点按；回放来源在底层及这里双重拒绝，所有检验位于发送前。"""
         with self.serial:
             with self.lock:
-                if token != self.generation or owner != self.owner or cancelled():
+                if token != self.generation or owner != self.owner or cancelled() or not self.lease():
                     raise ValueError("输入授权已撤销")
                 if owner in ("bot", "flow"):
                     if frame.transport != self.transport or self.clock() - self.heartbeat_at > 1.0:

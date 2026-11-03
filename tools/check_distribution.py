@@ -30,9 +30,14 @@ def check_archive(path: Path) -> None:
         "_vendor/douzero_resnet/models.py",
         "agents/resnet_features.py",
         "agents/backends.py",
+        "runtime/supervisor.py",
+        "runtime/session_process.py",
+        "runtime/process.py",
+        "storage/task_media.py",
+        "ui/unattended.py",
     ):
         if package_prefix + required not in names:
-            raise ValueError(f"发行包缺少 ResNet 源码或来源声明：{required}")
+            raise ValueError(f"发行包缺少运行源码或来源声明：{required}")
     forbidden = {"data", ".venv", "__pycache__", ".idea", ".git", ".pytest_cache", ".ruff_cache"}
     suffixes = {".mkv", ".mp4", ".onnx", ".ckpt", ".pkl", ".pt", ".sqlite3", ".pyc", ".log"}
     for name in names:

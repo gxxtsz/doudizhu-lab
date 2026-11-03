@@ -41,14 +41,15 @@ class ContinuousSimPipeline:
     bot_source = "simulation_bot"
     serial = "simulation"
 
-    def __init__(self, store, *, clock=monotonic, threaded=False, seed_start=91000):
+    def __init__(self, store, *, clock=monotonic, threaded=False, seed_start=91000, session_root=None):
+        """创建隔离模拟；session_root 仅供进程集成测试指定临时会话根目录，不连接手机。"""
         self.store, self.clock, self.threaded = store, clock, threaded
         self._started = clock()
         self.profile = deepcopy(store.profile)
         if not self.profile.seat_order:
             self.profile.seat_order = ["self", "right", "left"]
         self.session = SessionStore.create(
-            store.root / "continuous-simulation", self.profile, [], "simulation"
+            session_root or store.root / "continuous-simulation", self.profile, [], "simulation"
         )
         self.session.set_meta("source", "simulation_continuous")
         self.session.set_meta("note", "流程示意观察；未采集手机视频，也未检验真实像素识别")

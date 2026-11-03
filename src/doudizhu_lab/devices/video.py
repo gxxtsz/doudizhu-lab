@@ -300,10 +300,14 @@ class SegmentWriter:
     def check_space(self):
         """检查真实空闲空间及会话录像总额；调用方记录停止原因，不继续生成完整状态。"""
         if shutil.disk_usage(self.folder).free < self.min_free_bytes:
-            raise OSError("磁盘剩余空间低于 2 GiB，已停止录像")
+            from doudizhu_lab.runtime.faults import StorageUnavailable
+
+            raise StorageUnavailable("disk_space", "磁盘剩余空间低于 2 GiB，已停止录像")
         used = sum(path.stat().st_size for path in self.quota_root.rglob("*.mkv"))
         if used >= self.quota_bytes:
-            raise OSError("录像总额达到配置上限，已停止录像；请手动整理资料")
+            from doudizhu_lab.runtime.faults import StorageUnavailable
+
+            raise StorageUnavailable("video_quota", "录像总额达到配置上限，已停止录像")
 
     def write(self, packet: VideoPacket) -> None:
         """消费一个完整协议包；会话变化先关闭片段，等待新配置和新关键帧。"""

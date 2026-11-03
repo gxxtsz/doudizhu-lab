@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import queue
 import shutil
 import threading
@@ -25,6 +24,7 @@ class EvidenceWriter:
         self.folder.mkdir(parents=True, exist_ok=True)
         self.queue = queue.Queue(maxsize=capacity)
         self.lock = threading.Lock()
+        self.publish_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.entries = {}
         self.on_error = on_error
@@ -65,12 +65,38 @@ class EvidenceWriter:
             return False
 
     def _save(self):
+        from doudizhu_lab.storage.json_io import atomic_json
+
+        with self.publish_lock:
+            with self.lock:
+                value = deepcopy(self.entries)
+            atomic_json(self.folder / "index.json", value)
+
+    def rotate_window(self, start_us: int, end_us: int) -> int:
+        """轮转父任务指定封闭窗口的截图；不删排队、正在写入或下一窗口的截图。
+
+        由执行进程命令线程调用；先发布处置状态再删除，失败上抛供自动重试。
+        返回已删除数量，不更改原观察，也不重新生成已轮转截图。
+        """
         with self.lock:
-            value = deepcopy(self.entries)
-        path = self.folder / "index.json"
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+            names = [
+                name
+                for name, item in self.entries.items()
+                if item["pts_us"] is not None
+                and start_us <= item["pts_us"] < end_us
+                and item["status"] in ("saved", "rebuilt", "rotation_planned")
+            ]
+            if any(Path(name).name != name for name in names):
+                raise ValueError("截图轮转路径越界")
+            for name in names:
+                self.entries[name]["status"] = "rotation_planned"
+        self._save()
+        for name in names:
+            (self.folder / f"{name}.png").unlink(missing_ok=True)
+            with self.lock:
+                self.entries[name]["status"] = "policy_rotated"
+        self._save()
+        return len(names)
 
     def _write(self, name, frame, status):
         try:

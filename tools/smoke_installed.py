@@ -23,7 +23,7 @@ from doudizhu_lab.domain import Profile
 from doudizhu_lab.paths import PACKAGE_ROOT, project_files, workspace_root
 from doudizhu_lab.storage.config import Store, read_rgb, write_rgb
 from doudizhu_lab.storage.session import SessionStore
-from doudizhu_lab.ui.window import MainWindow
+from doudizhu_lab.ui.unattended import UnattendedWindow as MainWindow
 
 
 def main() -> None:
@@ -61,15 +61,17 @@ def main() -> None:
             session.verify_snapshot()
             package = session.folder / "engine/src/doudizhu_lab"
             assert (package / "agents/worker.py").is_file()
+            assert (package / "runtime/supervisor.py").is_file()
+            assert (package / "runtime/session_process.py").is_file()
             assert (package / "_vendor/bidding/BidModel.original.txt").is_file()
             assert session.metadata()["application_version"] == __version__
             report["snapshot_files"] = len(session.metadata()["engine_manifest"])
         finally:
             session.close()
-        window = MainWindow(store, auto_refresh=False)
+        window = MainWindow(store, auto_refresh=False, auto_load_model=False, auto_preview=False)
         window.show()
         application.processEvents()
-        assert window.bot_mode.currentData() == "suggest" and window.bot is None and not window.running
+        assert window.bot is None and not window.running and not window.canvas.control_enabled
         window.close()
         application.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

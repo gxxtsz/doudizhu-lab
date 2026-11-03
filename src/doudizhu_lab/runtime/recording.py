@@ -287,6 +287,23 @@ class RecordingPipeline:
         if self.remote_capture:
             self.stream.command("user_abort")
 
+    def pin_game(self, game_id: str, code: str, message: str, pts_us: int) -> None:
+        """由连续流程线程固定单局异常资料；不设置 failed，不停止健康视频或触发尾录。
+
+        game_id 与源时间绑定当前窗口；只向录像进程发本地处置命令，不操作手机。
+        真正采集或写盘故障仍必须调用 report_failure，不能用本接口掩盖。
+        """
+        self.session.add_recovery(
+            {"kind": "game_skipped", "game_id": game_id, "code": code, "message": message, "pts_us": pts_us}
+        )
+        if self.remote_capture:
+            self.stream.command("game_fault", game_id=game_id, code=code, message=message)
+
+    def finish_skipped_game(self, game_id: str, pts_us: int) -> None:
+        """可信结算入口关闭异常录像窗口；不写入有效完成事实，也不补齐缺失历史。"""
+        if self.remote_capture:
+            self.stream.command("game_skipped", game_id=game_id, pts_us=pts_us)
+
     def _health_report(self):
         """每秒跨进程报告健康信息；独立采集故障立即反映为失败，GUI据此撤销输入。"""
         last_gui = None

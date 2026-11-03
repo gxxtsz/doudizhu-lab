@@ -36,3 +36,6 @@ class DashboardState:
     model_backend: str = "resnet"
     model_name: str = "ResNet"
     model_id: str = ""
+    skipped: int = 0
+    retries: int = 0
+    retry_at: float | None = None

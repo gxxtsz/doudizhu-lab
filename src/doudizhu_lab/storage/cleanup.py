@@ -61,8 +61,8 @@ def legacy_inventory(root: Path) -> dict:
     identities = {os.path.normcase(s["path"]) for s in sessions}
     for database in sorted((root / "runs").glob("*/run.sqlite3")):
         meta = read_metadata(database)
-        source = meta.get("session")
-        if source and os.path.normcase(str(Path(source).resolve())) in identities:
+        sources = [meta["session"]] if meta.get("session") else meta.get("sessions", [])
+        if any(os.path.normcase(str(Path(source).resolve())) in identities for source in sources):
             folder = checked_tree(database.parent, root / "runs")
             runs.append(
                 {
@@ -100,7 +100,11 @@ def apply_legacy_cleanup(root: Path, manifest_path: Path) -> dict:
             if not path.exists():
                 continue
             meta = read_metadata(path / database)
-            active = ("recording",) if category == "sessions" else ("running", "paused")
+            active = (
+                ("recording",)
+                if category == "sessions"
+                else ("running", "paused", "preparing", "recovering", "waiting_external", "stopping")
+            )
             if meta.get("status") in active:
                 raise RuntimeError(f"资料仍在使用，须先正常停止：{path}")
             targets.append((entry, path, root / category))

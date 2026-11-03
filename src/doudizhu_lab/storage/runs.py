@@ -97,6 +97,58 @@ class RunStore:
         with self.lock:
             self.db.close()
 
+    @classmethod
+    def create_task(cls, root, profile, serial, *, simulation=False):
+        """在父进程创建无人值守任务账本，不创建设备会话或恢复任何旧输入授权。
+
+        profile 为本次配置快照，serial 固定设备；simulation 只供隔离模拟标记来源。
+        返回可追加的账本，I/O 异常交由看护器进入自动等待，调用者负责关闭。
+        """
+        ident = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid4().hex[:6]
+        result = cls(Path(root) / "runs" / ident)
+        for key, value in {
+            "version": 2,
+            "run_id": ident,
+            "profile": asdict(profile),
+            "device": serial,
+            "source": "simulation_continuous" if simulation else "live_continuous",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "running",
+        }.items():
+            result.set(key, value)
+        result.db.execute(
+            "CREATE TABLE IF NOT EXISTS task_events(event_id TEXT PRIMARY KEY,kind TEXT,payload TEXT)"
+        )
+        result.db.commit()
+        return result
+
+    def commit_event(self, event_id, kind, value):
+        """按稳定事件编号事务提交一次事实；重复交付返回 False，不增加完成局数。
+
+        仅父任务写入线程调用；返回 True 表示已经持久提交，可以回复执行进程。
+        不发送手机输入，写入失败抛出 sqlite3/OSError，不能先回复成功。
+        """
+        with self.lock, self.db:
+            cursor = self.db.execute(
+                "INSERT OR IGNORE INTO task_events VALUES (?,?,?)",
+                (event_id, kind, json.dumps(value, ensure_ascii=False)),
+            )
+            return bool(cursor.rowcount)
+
+    def task_outcomes(self) -> dict[str, str]:
+        """父账本写入异常恢复后只读核对已提交结果，避免把提交结果未知的有效局改成跳过。
+
+        仅任务看护线程调用，返回稳定牌局编号到结果类型的映射；不恢复任何输入授权。
+        SQLite 错误上抛，调用者继续等待存储恢复，不能凭内存猜测提交成功或失败。
+        """
+        with self.lock:
+            return {
+                json.loads(payload)["round_id"]: kind
+                for kind, payload in self.db.execute(
+                    "SELECT kind,payload FROM task_events WHERE kind IN ('game_complete','game_skipped')"
+                )
+            }
+
 
 def uncovered_video_intervals(segments, start_us, end_us):
     """返回牌局时间范围内未被录像覆盖的区间，容忍正常分段之间不超过250ms的帧间隔。
@@ -174,6 +226,12 @@ def evaluate_run(folder, *, output=None):
     folder = Path(folder)
     with closing(sqlite3.connect((folder / "run.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as db:
         meta = {k: json.loads(v) for k, v in db.execute("SELECT key,payload FROM meta")}
+        if meta.get("version") == 2:
+            events = [
+                (k, json.loads(v))
+                for k, v in db.execute("SELECT kind,payload FROM task_events ORDER BY rowid")
+            ]
+            return evaluate_task(folder, meta, events, output=output)
         journal = [(k, json.loads(v)) for k, v in db.execute("SELECT kind,payload FROM journal ORDER BY seq")]
         flow_frames = {
             fid: json.loads(v) for fid, v in db.execute("SELECT frame_id,payload FROM observations")
@@ -411,6 +469,8 @@ def evaluate_run(folder, *, output=None):
         "inferred_events": sum(e.get("source") == "operational_inferred" for e in operational_events),
         "inference_proof_errors": inference_errors,
         "completed_games": len(games),
+        "target_reached": len(games)
+        >= meta.get("profile", {}).get("continuous_settings", {}).get("max_games", 5),
         "tracking_completed_games": max(
             len(games), sum(w.get("outcome") == "completed" for w in retention.get("windows", []))
         ),
@@ -443,4 +503,53 @@ def evaluate_run(folder, *, output=None):
     target = Path(output) if output else folder / "连续任务报告.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf8")
+    return result
+
+
+def evaluate_task(folder, meta, events, *, output=None):
+    """汇总多会话任务；目标达成与严格验收分开，未知提交和异常不会被恢复次数冲掉。
+
+    仅读取子执行账本；缺失或未封口的子报告记为未通过。旧会话走原 evaluate_run。
+    输出中文报告文件，不修改原始观察、旧会话或完成事实。
+    """
+    sessions = [v for k, v in events if k == "session"]
+    games = [v for k, v in events if k == "game_complete"]
+    skipped = [v for k, v in events if k == "game_skipped"]
+    recoveries = [v for k, v in events if k == "recovery"]
+    audits = []
+    for session in sessions:
+        path = Path(session["run_folder"]) / "连续任务报告.json"
+        try:
+            child = json.loads(path.read_text(encoding="utf8"))
+            audits.append({"session": session, "passed": child.get("passed", False), "report": child})
+        except (OSError, ValueError):
+            audits.append({"session": session, "passed": False})
+    total = meta["profile"]["continuous_settings"]["max_games"]
+    reached = len(games) >= total
+    passed = bool(
+        meta.get("status") == "completed"
+        and reached
+        and not skipped
+        and not recoveries
+        and audits
+        and all(a["passed"] for a in audits)
+    )
+    result = {
+        "source": meta["source"],
+        "status": meta["status"],
+        "target_reached": reached,
+        "completed_games": len(games),
+        "required_games": total,
+        "skipped_games": len(skipped),
+        "games": games,
+        "skipped": skipped,
+        "recoveries": recoveries,
+        "sessions": audits,
+        "passed": passed,
+        "live_passed": passed and meta["source"] == "live_continuous",
+        "note": "任务目标按有效局数统计；恢复后完成不代表严格连续运行或录像验收通过。",
+    }
+    from doudizhu_lab.storage.json_io import atomic_json
+
+    atomic_json(Path(output) if output else Path(folder) / "连续任务报告.json", result)
     return result

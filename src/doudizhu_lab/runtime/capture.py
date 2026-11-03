@@ -333,7 +333,7 @@ class CaptureWorker:
                         resync = True
         except Exception as exc:
             if not self.stopped.is_set():
-                self.fault("capture", f"录像采集或写盘失败：{exc}")
+                self.fault(getattr(exc, "code", "capture"), f"录像采集或写盘失败：{exc}")
                 self.stopped.set()
 
     def _commands(self):
@@ -359,6 +359,49 @@ class CaptureWorker:
                 elif kind == "game_complete":
                     self.ledger.complete_game(value["game_id"], value["pts_us"])
                     self.ledger.prune(self.writer)
+                elif kind == "game_fault":
+                    self.ledger.pin_game(value["game_id"], value["code"], value["message"])
+                elif kind == "game_skipped":
+                    self.ledger.skip_game(value["game_id"], value["pts_us"])
+                    self.ledger.prune(self.writer)
+                elif kind == "rotate_media":
+                    names = set(value["names"])
+                    candidates = [
+                        s
+                        for s in self.writer.segments
+                        if s.file in names and s.closed and s.global_end_us < self.ledger.active["start_us"]
+                    ]
+                    if any(Path(s.file).name != s.file for s in candidates):
+                        raise ValueError("轮转媒体路径越界")
+                    for segment in candidates:
+                        if not any(r["file"] == segment.file for r in self.ledger.removed):
+                            self.ledger.removed.append(
+                                {
+                                    "file": segment.file,
+                                    "start_us": segment.global_start_us,
+                                    "end_us": segment.global_end_us,
+                                    "reason": "task_media_rotation",
+                                    "status": "planned",
+                                }
+                            )
+                    self.ledger.persist()
+                    pending = [
+                        r
+                        for r in self.ledger.removed
+                        if r["file"] in names
+                        and r["reason"] == "task_media_rotation"
+                        and r["end_us"] < self.ledger.active["start_us"]
+                    ]
+                    accepted = {r["file"] for r in pending}
+                    self.writer.segments[:] = [s for s in self.writer.segments if s.file not in accepted]
+                    self.writer._index()
+                    for record in pending:
+                        try:
+                            (self.writer.folder / record["file"]).unlink(missing_ok=True)
+                            record["status"] = "removed"
+                        except OSError as exc:
+                            record["cleanup_error"] = str(exc)
+                    self.ledger.persist()
                 elif kind == "user_abort":
                     self.ledger.abort_window()
                     self.ledger.prune(self.writer)

@@ -39,6 +39,8 @@ TASK_NAMES = {
     "completed": "已完成",
     "stopped": "已停止",
     "failed": "需要处理",
+    "recovering": "自动恢复中",
+    "waiting_external": "等待条件恢复",
 }
 
 
